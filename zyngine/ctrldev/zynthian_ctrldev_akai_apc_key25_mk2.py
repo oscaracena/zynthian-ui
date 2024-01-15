@@ -207,20 +207,22 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
             if self._is_shifted:
                 if note == BTN_KNOB_CTRL_DEVICE:
                     self._current_handler = self._device_handler
-                if note in [BTN_KNOB_CTRL_PAN, BTN_KNOB_CTRL_VOLUME]:
+                elif note in [BTN_KNOB_CTRL_PAN, BTN_KNOB_CTRL_VOLUME]:
                     self._current_handler = self._mixer_handler
                     self._padmatrix_handler.refresh()
 
             if self._current_handler == self._mixer_handler:
                 if BTN_PAD_START <= note <= BTN_PAD_END:
                     return self._padmatrix_handler.pad_press(note)
-                elif note == BTN_RECORD:
+                elif note == BTN_RECORD and not self._is_shifted:
                     return self._padmatrix_handler.on_record_changed(True)
                 elif note == BTN_PLAY:
                     return self._padmatrix_handler.on_toggle_play()
                 elif BTN_TRACK_1 <= note <= BTN_TRACK_8:
                     self._padmatrix_handler.on_track_changed(
                         note - BTN_TRACK_1, True)
+                elif note == BTN_STOP_ALL_CLIPS:
+                    self._padmatrix_handler.stop_all_seqs()
 
             return self._current_handler.note_on(note, self._is_shifted)
 
@@ -264,6 +266,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
 
     def _on_gui_show_screen(self, screen):
         self._device_handler.on_screen_change(screen)
+        self._padmatrix_handler.on_screen_change(screen)
         if self._current_handler == self._device_handler:
             self._current_handler.refresh()
 
@@ -322,7 +325,7 @@ class ButtonTimer(Thread):
     def _run_callback(self, btn):
         try:
             self._callback(btn)
-        except Exception as ex:
+        except Exception:
             pass
 
 
@@ -570,7 +573,6 @@ class DeviceHandler(BaseHandler):
         # print(f"{media} {kind} {state}")
         flags = self._is_playing if kind == "player" else self._is_recording
         flags.add(media) if state else flags.discard(media)
-        self.refresh()
 
     def _handle_button(self, btn, press_type):
         actions = self._btn_actions.get(btn)
@@ -708,6 +710,12 @@ class MixerHandler(BaseHandler):
                 self._run_track_button_function_on_channel(255)
             elif note == BTN_SOFT_KEY_SELECT:
                 self._track_buttons_function = FN_SELECT
+            elif note == BTN_RECORD:
+                self._state_manager.send_cuia("TOGGLE_RECORD")
+                return True  # skip refresh
+            elif note == BTN_UP:
+                self._state_manager.send_cuia("BACK")
+                return True  # skip refresh
             else:
                 return False
             self.refresh()
@@ -834,6 +842,7 @@ class PadMatrixHandler(BaseHandler):
         self._rows = 5
         self._is_record_pressed = False
         self._is_track_ressed = None
+        self._current_screen = None
 
         # FIXME: this value should be updated by a signal, to be in sync with UI state
         self._recording_seq = None
@@ -854,6 +863,9 @@ class PadMatrixHandler(BaseHandler):
 
     def on_track_changed(self, track, state):
         self._is_track_ressed = track if state else None
+
+    def on_screen_change(self, screen):
+        self._current_screen = screen
 
     def refresh(self):
         if not self._libseq.isMidiRecord():
@@ -895,6 +907,12 @@ class PadMatrixHandler(BaseHandler):
     def pad_off(self, col, row):
         index = col * self._rows + row
         self._leds.led_off(self._pads[index])
+
+    def stop_all_seqs(self):
+        for seq in range(self._zynseq.col_in_bank ** 2):
+            state = self._libseq.getPlayState(self._zynseq.bank, seq)
+            if state not in [zynseq.SEQ_STOPPED, zynseq.SEQ_STOPPING, zynseq.SEQ_STOPPINGSYNC]:
+                self._libseq.togglePlayState(self._zynseq.bank, seq)
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         col, row = self._zynseq.get_xy_from_pad(seq)
@@ -954,10 +972,17 @@ class PadMatrixHandler(BaseHandler):
         self._update_pad(seq)
 
     def _show_pattern_editor(self, seq):
-        self._state_manager.send_cuia("SCREEN_ZYNPAD")
+        # This way shows Zynpad everytime you change the sequuence (but is decoupled from UI)
+        # self._state_manager.send_cuia("SCREEN_ZYNPAD")
+        # self._select_pad(seq)
+        # self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
+
+        # This way avoid to show Zynpad every time, BUT is coupled to UI!
+        if self._current_screen != 'pattern_editor':
+            self._state_manager.send_cuia("SCREEN_ZYNPAD")
         self._select_pad(seq)
-        self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
+        zynthian_gui_config.zyngui.screens["zynpad"].show_pattern_editor()
 
     def _select_pad(self, pad):
-        # FIXME: this SHOULD be a CUIA, not this hack!
+        # FIXME: this SHOULD be a CUIA, not this hack! (is coupled with UI)
         zynthian_gui_config.zyngui.screens["zynpad"].select_pad(pad)
