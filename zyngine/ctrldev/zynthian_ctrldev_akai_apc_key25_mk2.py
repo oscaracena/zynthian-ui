@@ -5,7 +5,7 @@
 #
 # Zynthian Control Device Driver for "Akai APC Key 25 mk2"
 #
-# Copyright (C) 2023 Oscar Aceña <oscaracena@gmail.com>
+# Copyright (C) 2023,2024 Oscar Aceña <oscaracena@gmail.com>
 #
 #******************************************************************************
 #
@@ -135,6 +135,7 @@ FN_SOLO                              = 0x02
 FN_MUTE                              = 0x03
 FN_REC_ARM                           = 0x04
 FN_SELECT                            = 0x05
+FN_SCENE                             = 0x06
 
 PT_SHORT                             = "short"
 PT_BOLD                              = "bold"
@@ -252,7 +253,8 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
             self._current_handler.update_strip(chan, symbol, value)
 
     def update_mixer_active_chain(self, active_chain):
-        self._mixer_handler.set_active_chain(active_chain)
+        refresh = self._current_handler == self._mixer_handler
+        self._mixer_handler.set_active_chain(active_chain, refresh)
 
     def update_seq_state(self, *args, **kwargs):
         if self._current_handler == self._mixer_handler:
@@ -355,6 +357,9 @@ class FeedbackLEDs:
         for btn in buttons:
             self.led_off(btn)
 
+    def led_state(self, led, state):
+        (self.led_on if state else self.led_off)(led)
+
     def led_off(self, led):
         lib_zyncore.dev_send_note_on(self._idev, 0, led, 0)
 
@@ -441,7 +446,7 @@ class DeviceHandler(BaseHandler):
     def refresh(self):
         self._leds.all_off()
 
-        # On this mode, DEVICE led is allways lit
+        # On this mode, DEVICE led is always lit
         self._leds.led_blink(BTN_KNOB_CTRL_DEVICE)
 
         # Lit up fixed buttons
@@ -544,7 +549,6 @@ class DeviceHandler(BaseHandler):
         self._state_manager.send_cuia("ZYNPOT", [zynpot, delta])
 
     def on_screen_change(self, screen):
-        # print(f"SCREEN: {screen}")
         screen_map = {
             "option":         (BTN_OPT_ADMIN, 0),
             "main_menu":      (BTN_OPT_ADMIN, 0),
@@ -570,7 +574,6 @@ class DeviceHandler(BaseHandler):
             pass
 
     def on_media_change(self, media, kind, state):
-        # print(f"{media} {kind} {state}")
         flags = self._is_playing if kind == "player" else self._is_recording
         flags.add(media) if state else flags.discard(media)
 
@@ -600,7 +603,6 @@ class DeviceHandler(BaseHandler):
             cuia, params = cuia.split(":")
             params = params.split(",")
 
-        # print(f"CUIA: {cuia} ({params})")
         self._state_manager.send_cuia(cuia, params)
         return True
 
@@ -657,6 +659,7 @@ class MixerHandler(BaseHandler):
                 FN_MUTE: BTN_SOFT_KEY_MUTE,
                 FN_SOLO: BTN_SOFT_KEY_SOLO,
                 FN_SELECT: BTN_SOFT_KEY_SELECT,
+                FN_SCENE: BTN_SOFT_KEY_REC_ARM,
             }[self._track_buttons_function]
             self._leds.led_on(btn)
 
@@ -666,23 +669,27 @@ class MixerHandler(BaseHandler):
 
         # Otherwise, show current function status
         else:
+            if self._track_buttons_function == FN_SCENE:
+                for i in range(8):
+                    scene = i + (8 if self._chains_bank == 1 else 0)
+                    state = scene == (self._zynseq.bank - 1)
+                    self._leds.led_state(BTN_TRACK_1 + i, state)
+                return
+
             query = {
                 FN_MUTE: self._zynmixer.get_mute,
                 FN_SOLO: self._zynmixer.get_solo,
                 FN_SELECT: lambda c: c == (self._active_chain - 1),
             }[self._track_buttons_function]
             for i in range(8):
-                channel = i + (8 if self._chains_bank == 1 else 0)
-                chain = self._chain_manager.get_chain_by_index(channel)
+                scene = i + (8 if self._chains_bank == 1 else 0)
+                chain = self._chain_manager.get_chain_by_index(scene)
                 if not chain:
                     break
                 # Main channel ignored
                 if chain.chain_id == 0:
                     continue
-                if query(channel):
-                    self._leds.led_on(BTN_TRACK_1 + i)
-                else:
-                    self._leds.led_off(BTN_TRACK_1 + i)
+                self._leds.led_state(BTN_TRACK_1 + i, query(scene))
 
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
@@ -702,6 +709,8 @@ class MixerHandler(BaseHandler):
                 self._track_buttons_function = FN_MUTE
             elif note == BTN_SOFT_KEY_SOLO:
                 self._track_buttons_function = FN_SOLO
+            elif note == BTN_SOFT_KEY_REC_ARM:
+                self._track_buttons_function = FN_SCENE
             elif note == BTN_LEFT:
                 self._chains_bank = 0
             elif note == BTN_RIGHT:
@@ -738,16 +747,17 @@ class MixerHandler(BaseHandler):
         chan -= self._chains_bank * 8
         if 0 > chan > 8:
             return
-        (self._leds.led_on if value else self._leds.led_off)(BTN_TRACK_1 + chan)
+        self._leds.led_state(BTN_TRACK_1 + chan, value)
         return True
 
-    def set_active_chain(self, chain):
+    def set_active_chain(self, chain, refresh):
         # Do not change chain if 'main' is selected
         if chain == 0:
             return
         self._chains_bank = 0 if chain <= 8 else 1
         self._active_chain = chain
-        self.refresh()
+        if refresh:
+            self.refresh()
 
     def _update_volume(self, ccnum, ccval):
         return self._update_control("level", ccnum, ccval, 0, 100)
@@ -757,7 +767,7 @@ class MixerHandler(BaseHandler):
 
     def _update_control(self, type, ccnum, ccval, minv, maxv):
         if self._is_shifted:
-            # Only main chain is handled with shift, ignore the rest
+            # Only main chain is handled with SHIFT, ignore the rest
             if ccnum != self.main_chain_knob:
                 return False
             mixer_chan = 255
@@ -768,7 +778,6 @@ class MixerHandler(BaseHandler):
                 return False
             mixer_chan = chain.mixer_chan
 
-        # NOTE: knobs are encoders, not pots (so ccval is relative)
         if type == "level":
             value = self._zynmixer.get_level(mixer_chan)
             set_value = self._zynmixer.set_level
@@ -778,6 +787,7 @@ class MixerHandler(BaseHandler):
         else:
             return False
 
+        # NOTE: knobs are encoders, not pots (so ccval is relative)
         value *= 100
         value += ccval if ccval < 64 else ccval - 128
         value = max(minv, min(value, maxv))
@@ -786,6 +796,11 @@ class MixerHandler(BaseHandler):
 
     def _run_track_button_function(self, note):
         index = (note - BTN_TRACK_1) + self._chains_bank * 8
+        if self._track_buttons_function == FN_SCENE:
+            self._zynseq.select_bank(index + 1)
+            self._state_manager.send_cuia("SCREEN_ZYNPAD")
+            return True
+
         chain = self._chain_manager.get_chain_by_index(index)
         if chain is None or chain.chain_id == 0:
             return False
@@ -793,7 +808,11 @@ class MixerHandler(BaseHandler):
         return self._run_track_button_function_on_channel(chain)
 
     def _run_track_button_function_on_channel(self, chain):
-        channel = chain.mixer_chan
+        if isinstance(chain, int):
+            channel = chain
+            chain = None
+        else:
+            channel = chain.mixer_chan
 
         if self._track_buttons_function == FN_MUTE:
             val = self._zynmixer.get_mute(channel) ^ 1
@@ -805,8 +824,9 @@ class MixerHandler(BaseHandler):
             self._zynmixer.set_solo(channel, val, True)
             return True
 
-        if self._track_buttons_function == FN_SELECT:
+        if self._track_buttons_function == FN_SELECT and chain is not None:
             self._chain_manager.set_active_chain_by_id(chain.chain_id)
+            return True
 
 
 # --------------------------------------------------------------------------
@@ -977,7 +997,7 @@ class PadMatrixHandler(BaseHandler):
         # self._select_pad(seq)
         # self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
 
-        # This way avoid to show Zynpad every time, BUT is coupled to UI!
+        # This way avoids to show Zynpad every time, BUT is coupled to UI!
         if self._current_screen != 'pattern_editor':
             self._state_manager.send_cuia("SCREEN_ZYNPAD")
         self._select_pad(seq)
