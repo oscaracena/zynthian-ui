@@ -57,6 +57,8 @@ BTN_TRACK_6 = BTN_KNOB_CTRL_PAN      = 0x45
 BTN_TRACK_7 = BTN_KNOB_CTRL_SEND     = 0x46
 BTN_TRACK_8 = BTN_KNOB_CTRL_DEVICE   = 0x47
 
+BTN_SOFT_KEY_START                   = 0x52
+BTN_SOFT_KEY_END                     = 0x56
 BTN_SOFT_KEY_CLIP_STOP = BTN_KNOB_1  = 0x52
 BTN_SOFT_KEY_SOLO = BTN_KNOB_2       = 0x53
 BTN_SOFT_KEY_MUTE = BTN_KNOB_3       = 0x54
@@ -140,6 +142,8 @@ FN_SCENE                             = 0x06
 PT_SHORT                             = "short"
 PT_BOLD                              = "bold"
 PT_LONG                              = "long"
+PT_BOLD_TIME                         = 0.3
+PT_LONG_TIME                         = 2.0
 
 
 # --------------------------------------------------------------------------
@@ -212,6 +216,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                     self._current_handler = self._mixer_handler
                     self._padmatrix_handler.refresh()
 
+            # Padmatrix is managed together with mixer
             if self._current_handler == self._mixer_handler:
                 if BTN_PAD_START <= note <= BTN_PAD_END:
                     return self._padmatrix_handler.pad_press(note)
@@ -219,11 +224,15 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                     return self._padmatrix_handler.on_record_changed(True)
                 elif note == BTN_PLAY:
                     return self._padmatrix_handler.on_toggle_play()
+                elif (BTN_SOFT_KEY_START <= note <= BTN_SOFT_KEY_END
+                      and not self._is_shifted):
+                    row = note - BTN_SOFT_KEY_START
+                    return self._padmatrix_handler.on_toggle_play_row(row)
                 elif BTN_TRACK_1 <= note <= BTN_TRACK_8:
-                    self._padmatrix_handler.on_track_changed(
-                        note - BTN_TRACK_1, True)
+                    track = note - BTN_TRACK_1
+                    self._padmatrix_handler.on_track_changed(track, True)
                 elif note == BTN_STOP_ALL_CLIPS:
-                    self._padmatrix_handler.stop_all_seqs()
+                    self._padmatrix_handler.note_on(note, self._is_shifted)
 
             return self._current_handler.note_on(note, self._is_shifted)
 
@@ -237,6 +246,8 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                     return self._padmatrix_handler.on_record_changed(False)
                 elif BTN_TRACK_1 <= note <= BTN_TRACK_8:
                     self._padmatrix_handler.on_track_changed(note, False)
+                elif note == BTN_STOP_ALL_CLIPS:
+                    self._padmatrix_handler.note_off(note, self._is_shifted)
 
             return self._current_handler.note_off(note, self._is_shifted)
 
@@ -262,9 +273,10 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
 
     def _on_shift_changed(self, state):
         self._is_shifted = state
+        self._current_handler.on_shift_changed(state)
         if self._current_handler == self._mixer_handler:
             self._padmatrix_handler.on_shift_changed(state)
-        return self._current_handler.on_shift_changed(state)
+        return True
 
     def _on_gui_show_screen(self, screen):
         self._device_handler.on_screen_change(screen)
@@ -279,12 +291,11 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
 
 
 # --------------------------------------------------------------------------
-# A handy timer for triggering long push actions
+# A handy timer for triggering short/bold/long push actions
 # --------------------------------------------------------------------------
 class ButtonTimer(Thread):
-    def __init__(self, seconds, callback):
+    def __init__(self, callback):
         super().__init__()
-        self._seconds = seconds
         self._callback = callback
         self._lock = RLock()
         self._awake = Event()
@@ -300,14 +311,17 @@ class ButtonTimer(Thread):
 
     def is_released(self, btn):
         with self._lock:
-            self._pressed.pop(btn, None)
+            ts = self._pressed.pop(btn, None)
+        if ts is not None:
+            elapsed = time.time() - ts
+            self._run_callback(btn, elapsed)
 
     def run(self):
         while True:
             with self._lock:
-                expired = self._get_expired()
+                expired, elapsed = self._get_expired()
             if expired is not None:
-                self._run_callback(expired)
+                self._run_callback(expired, elapsed)
 
             time.sleep(0.1)
             if not self._pressed:
@@ -318,17 +332,20 @@ class ButtonTimer(Thread):
         now = time.time()
         retval = None
         for btn, ts in self._pressed.items():
-            if now - ts > self._seconds:
+            elapsed = now - ts
+            if elapsed > PT_LONG_TIME:
                 retval = btn
+                break
         if retval:
             self._pressed.pop(btn, None)
-        return retval
+        return retval, elapsed if retval else 0
 
-    def _run_callback(self, btn):
+    def _run_callback(self, note, elapsed):
+        ptype = [PT_SHORT, PT_BOLD, PT_LONG][bisect([PT_BOLD_TIME, PT_LONG_TIME], elapsed)]
         try:
-            self._callback(btn)
-        except Exception:
-            pass
+            self._callback(note, ptype)
+        except Exception as ex:
+            print(f" error in handler: {ex}")
 
 
 # --------------------------------------------------------------------------
@@ -410,12 +427,11 @@ class BaseHandler:
 class DeviceHandler(BaseHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._pressed = {}
         self._knobs_ease = {}
         self._is_alt_active = False
         self._is_playing = set()
         self._is_recording = set()
-        self._btn_timer = ButtonTimer(2, self._handle_long_press)
+        self._btn_timer = ButtonTimer(self._handle_timed_button)
 
         self._btn_actions = {
             BTN_OPT_ADMIN:      ("MENU", "SCREEN_ADMIN"),
@@ -506,23 +522,12 @@ class DeviceHandler(BaseHandler):
                     return True
 
                 # Buttons that may have bold/long press
-                now = time.time()
-                self._pressed[note] = now
-                self._btn_timer.is_pressed(note, now)
+                self._btn_timer.is_pressed(note, time.time())
             return True
 
     def note_off(self, note, shifted_override=None):
         self._on_shifted_override(shifted_override)
         self._btn_timer.is_released(note)
-
-        ts = self._pressed.pop(note, None)
-        if ts is None:
-            return
-
-        elapsed = time.time() - ts
-        ptype = [PT_SHORT, PT_BOLD, PT_LONG][bisect([0.3, 2], elapsed)]
-        self._handle_button(note, ptype)
-        return True
 
     def cc_change(self, ccnum, ccval):
         zynpot = {
@@ -577,7 +582,17 @@ class DeviceHandler(BaseHandler):
         flags = self._is_playing if kind == "player" else self._is_recording
         flags.add(media) if state else flags.discard(media)
 
-    def _handle_button(self, btn, press_type):
+    def _handle_timed_button(self, btn, press_type):
+        if press_type == PT_LONG:
+            cuia = {
+                BTN_OPT_ADMIN:   "POWER_OFF",
+                BTN_CTRL_PRESET: "PRESET_FAV",
+                BTN_PAD_STEP:    "SCREEN_ARRANGER",
+            }.get(btn)
+            if cuia:
+                self._state_manager.send_cuia(cuia)
+            return True
+
         actions = self._btn_actions.get(btn)
         if actions is None:
             return
@@ -593,9 +608,6 @@ class DeviceHandler(BaseHandler):
             # In buttons with 2 functions, the default on bold press is the second
             idx = 1 if len(actions) > 1 else 0
             cuia = actions[idx]
-        else:
-            # Long press is fired by a timer, ignore it here
-            return False
 
         # Split params, if given
         params = []
@@ -605,20 +617,6 @@ class DeviceHandler(BaseHandler):
 
         self._state_manager.send_cuia(cuia, params)
         return True
-
-    def _handle_long_press(self, btn):
-        stored_ts = self._pressed.get(btn)
-        # Action already triggered
-        if not stored_ts:
-            return
-
-        cuia = {
-            BTN_OPT_ADMIN:   "POWER_OFF",
-            BTN_CTRL_PRESET: "PRESET_FAV",
-            BTN_PAD_STEP:    "SCREEN_ARRANGER",
-        }.get(btn)
-        if cuia:
-            self._state_manager.send_cuia(cuia)
 
 
 # --------------------------------------------------------------------------
@@ -631,7 +629,6 @@ class MixerHandler(BaseHandler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
         self._is_shifted = False
         self._knobs_function = FN_VOLUME
         self._track_buttons_function = FN_SELECT
@@ -697,9 +694,9 @@ class MixerHandler(BaseHandler):
         return retval
 
     def note_on(self, note, shifted_override=None):
-        super().note_on(note, shifted_override)
+        self._on_shifted_override(shifted_override)
 
-        # Handle alternative functions if SHIFT is pressed
+        # Handle alternative functions, if SHIFT is pressed
         if self._is_shifted:
             if note == BTN_KNOB_CTRL_VOLUME:
                 self._knobs_function = FN_VOLUME
@@ -730,8 +727,8 @@ class MixerHandler(BaseHandler):
             self.refresh()
             return True
 
+        # Handle primary functions
         else:
-            # Run track buttons' selected function
             if BTN_TRACK_1 <= note <= BTN_TRACK_8:
                 return self._run_track_button_function(note)
 
@@ -796,6 +793,8 @@ class MixerHandler(BaseHandler):
 
     def _run_track_button_function(self, note):
         index = (note - BTN_TRACK_1) + self._chains_bank * 8
+
+        # FIXME: move this to padmatrix handler!
         if self._track_buttons_function == FN_SCENE:
             self._zynseq.select_bank(index + 1)
             self._state_manager.send_cuia("SCREEN_ZYNPAD")
@@ -863,6 +862,8 @@ class PadMatrixHandler(BaseHandler):
         self._is_record_pressed = False
         self._is_track_ressed = None
         self._current_screen = None
+        self._playing_seqs = set()
+        self._btn_timer = ButtonTimer(self._handle_timed_button)
 
         # FIXME: this value should be updated by a signal, to be in sync with UI state
         self._recording_seq = None
@@ -881,11 +882,44 @@ class PadMatrixHandler(BaseHandler):
     def on_toggle_play(self):
         self._state_manager.send_cuia("TOGGLE_PLAY")
 
+    def on_toggle_play_row(self, row):
+        if row >= self._zynseq.col_in_bank:
+            return True
+
+        # Get overall status: playing if at least one sequence is playing
+        is_playing = False
+        for col in range(self._zynseq.col_in_bank):
+            seq = col * self._zynseq.col_in_bank + row
+            if seq in self._playing_seqs:
+                is_playing = True
+                break
+
+        stop_states = (zynseq.SEQ_STOPPED, zynseq.SEQ_STOPPING, zynseq.SEQ_STOPPINGSYNC)
+        play_states = (zynseq.SEQ_RESTARTING, zynseq.SEQ_STARTING, zynseq.SEQ_PLAYING)
+        for col in range(self._zynseq.col_in_bank):
+            seq = col * self._zynseq.col_in_bank + row
+            # We only play sequences that are not empty
+            if not is_playing and self._libseq.isEmpty(self._zynseq.bank, seq):
+                continue
+            state = self._libseq.getPlayState(self._zynseq.bank, seq)
+            if is_playing and state in stop_states:
+                continue
+            if not is_playing and state in play_states:
+                continue
+            self._libseq.togglePlayState(self._zynseq.bank, seq)
+
     def on_track_changed(self, track, state):
         self._is_track_ressed = track if state else None
 
     def on_screen_change(self, screen):
         self._current_screen = screen
+
+    def on_shift_changed(self, state):
+        retval = super().on_shift_changed(state)
+        # Update row launchers only when SHIFT is not pressed
+        if not state:
+            self._refresh_row_launchers()
+        return retval
 
     def refresh(self):
         if not self._libseq.isMidiRecord():
@@ -899,7 +933,19 @@ class PadMatrixHandler(BaseHandler):
                     continue
 
                 seq = c * self._zynseq.col_in_bank + r
-                self._update_pad(seq)
+                self._update_pad(seq, False)
+
+        self._refresh_row_launchers()
+
+    def note_on(self, note, shifted_override=None):
+        self._on_shifted_override(shifted_override)
+        if not self._is_shifted:
+            if note == BTN_STOP_ALL_CLIPS:
+                self._btn_timer.is_pressed(note, time.time())
+
+    def note_off(self, note, shifted_override=None):
+        if note == BTN_STOP_ALL_CLIPS:
+            self._btn_timer.is_released(note)
 
     def pad_press(self, pad):
         index = self._pads.index(pad)
@@ -928,13 +974,7 @@ class PadMatrixHandler(BaseHandler):
         index = col * self._rows + row
         self._leds.led_off(self._pads[index])
 
-    def stop_all_seqs(self):
-        for seq in range(self._zynseq.col_in_bank ** 2):
-            state = self._libseq.getPlayState(self._zynseq.bank, seq)
-            if state not in [zynseq.SEQ_STOPPED, zynseq.SEQ_STOPPING, zynseq.SEQ_STOPPINGSYNC]:
-                self._libseq.togglePlayState(self._zynseq.bank, seq)
-
-    def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
+    def update_seq_state(self, bank, seq, state=None, mode=None, group=None, refresh=True):
         col, row = self._zynseq.get_xy_from_pad(seq)
         btn = self._pads[col * self._rows + row]
         pattern = self._libseq.getPattern(bank, seq, 0, 0)
@@ -945,20 +985,37 @@ class PadMatrixHandler(BaseHandler):
             led_mode = LED_BLINKING_16
         elif state == zynseq.SEQ_PLAYING:
             led_mode = LED_BLINKING_8
+            self._playing_seqs.add(seq)
         elif state in (zynseq.SEQ_STOPPING, zynseq.SEQ_STARTING):
             led_mode = LED_PULSING_2
         else:
             led_mode = LED_BRIGHT_25 if is_empty else LED_BRIGHT_100
+            self._playing_seqs.discard(seq)
 
         self._leds.led_on(btn, color, led_mode)
+        if refresh:
+            self._refresh_row_launchers()
 
-    def _update_pad(self, seq):
+    def _handle_timed_button(self, btn, ptype):
+        if btn == BTN_STOP_ALL_CLIPS:
+            if ptype != PT_LONG:
+                in_all_banks = ptype == PT_BOLD
+                self._stop_all_seqs(in_all_banks)
+
+    def _update_pad(self, seq, refresh=True):
         state = self._libseq.getSequenceState(self._zynseq.bank, seq)
         mode = (state >> 8) & 0xFF
         group = (state >> 16) & 0xFF
         state &= 0xFF
         self.update_seq_state(
-            bank=self._zynseq.bank, seq=seq, state=state, mode=mode, group=group)
+            bank=self._zynseq.bank, seq=seq, state=state, mode=mode, group=group,
+            refresh=refresh)
+
+    def _refresh_row_launchers(self):
+        playing_rows = {seq % self._zynseq.col_in_bank for seq in self._playing_seqs}
+        for row in range(5):
+            state = row in playing_rows
+            self._leds.led_state(BTN_SOFT_KEY_START + row, state)
 
     def _start_pattern_record(self, seq):
         channel = self._libseq.getChannel(self._zynseq.bank, seq, 0)
@@ -978,6 +1035,20 @@ class PadMatrixHandler(BaseHandler):
 
         self._recording_seq = seq
         self._update_pad(seq)
+
+    def _stop_all_seqs(self, in_all_banks=False):
+        bank = 0 if in_all_banks else self._zynseq.bank
+        while True:
+            seq_num = self._libseq.getSequencesInBank(bank)
+            for seq in range(seq_num):
+                state = self._libseq.getPlayState(bank, seq)
+                if state not in [zynseq.SEQ_STOPPED, zynseq.SEQ_STOPPING, zynseq.SEQ_STOPPINGSYNC]:
+                    self._libseq.togglePlayState(bank, seq)
+            if not in_all_banks:
+                break
+            bank += 1
+            if bank >= 64 or self._libseq.getPlayingSequences() == 0:
+                break
 
     def _stop_pattern_record(self):
         if self._libseq.isMidiRecord():
