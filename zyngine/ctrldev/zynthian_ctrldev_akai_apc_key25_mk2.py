@@ -216,7 +216,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                     self._current_handler = self._mixer_handler
                     self._padmatrix_handler.refresh()
 
-            # Padmatrix is managed together with mixer
+            # Padmatrix related events
             if self._current_handler == self._mixer_handler:
                 if BTN_PAD_START <= note <= BTN_PAD_END:
                     return self._padmatrix_handler.pad_press(note)
@@ -241,6 +241,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
             if note == BTN_SHIFT:
                 return self._on_shift_changed(False)
 
+            # Padmatrix related events
             if self._current_handler == self._mixer_handler:
                 if note == BTN_RECORD:
                     return self._padmatrix_handler.on_record_changed(False)
@@ -539,6 +540,7 @@ class DeviceHandler(BaseHandler):
         if zynpot is None:
             return
 
+        # Knobs ease is used to control knob speed
         count = self._knobs_ease.get(ccnum, 0)
         delta = ccval if ccval < 64 else (ccval - 128)
         steps = 2 if self._is_shifted else 8
@@ -620,7 +622,7 @@ class DeviceHandler(BaseHandler):
 
 
 # --------------------------------------------------------------------------
-# Handle Mixer (volume/pan mode)
+# Handle Mixer (Mixpad mode)
 # --------------------------------------------------------------------------
 class MixerHandler(BaseHandler):
 
@@ -637,7 +639,6 @@ class MixerHandler(BaseHandler):
         active_chain = self._chain_manager.get_active_chain()
         self._active_chain = active_chain.chain_id if active_chain else 0
 
-    # NOTE: make this as fast and light as posible!
     def refresh(self):
         self._leds.control_leds_off()
 
@@ -696,7 +697,7 @@ class MixerHandler(BaseHandler):
     def note_on(self, note, shifted_override=None):
         self._on_shifted_override(shifted_override)
 
-        # Handle alternative functions, if SHIFT is pressed
+        # If SHIFT is pressed, handle alternative functions
         if self._is_shifted:
             if note == BTN_KNOB_CTRL_VOLUME:
                 self._knobs_function = FN_VOLUME
@@ -727,7 +728,7 @@ class MixerHandler(BaseHandler):
             self.refresh()
             return True
 
-        # Handle primary functions
+        # Otherwise, handle primary functions
         else:
             if BTN_TRACK_1 <= note <= BTN_TRACK_8:
                 return self._run_track_button_function(note)
@@ -829,7 +830,7 @@ class MixerHandler(BaseHandler):
 
 
 # --------------------------------------------------------------------------
-#  Handle Pad Matrix for Zynseq (in volume/pan mode)
+#  Handle pad matrix for Zynseq (in Mixpad mode)
 # --------------------------------------------------------------------------
 class PadMatrixHandler(BaseHandler):
 
@@ -998,7 +999,14 @@ class PadMatrixHandler(BaseHandler):
 
     def _handle_timed_button(self, btn, ptype):
         if btn == BTN_STOP_ALL_CLIPS:
-            if ptype != PT_LONG:
+            if ptype == PT_LONG:
+                self._state_manager.send_cuia("ALL_SOUNDS_OFF")
+                self._state_manager.stop_midi_playback()
+                self._state_manager.stop_audio_player()
+                # FIXME: this is fishy...
+                self._state_manager.audio_player.engine.player.set_position(
+                    self._state_manager.audio_player.handle, 0.0)
+            else:
                 in_all_banks = ptype == PT_BOLD
                 self._stop_all_seqs(in_all_banks)
 
@@ -1068,7 +1076,7 @@ class PadMatrixHandler(BaseHandler):
         # self._select_pad(seq)
         # self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
 
-        # This way avoids to show Zynpad every time, BUT is coupled to UI!
+        # FIXME: this way avoids to show Zynpad every time, BUT is coupled to UI!
         if self._current_screen != 'pattern_editor':
             self._state_manager.send_cuia("SCREEN_ZYNPAD")
         self._select_pad(seq)
