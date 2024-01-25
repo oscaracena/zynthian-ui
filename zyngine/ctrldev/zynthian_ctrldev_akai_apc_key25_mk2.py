@@ -699,14 +699,14 @@ class MixerHandler(BaseHandler):
                 FN_SELECT: lambda c: c == (self._active_chain - 1),
             }[self._track_buttons_function]
             for i in range(8):
-                scene = i + (8 if self._chains_bank == 1 else 0)
-                chain = self._chain_manager.get_chain_by_index(scene)
+                index = i + (8 if self._chains_bank == 1 else 0)
+                chain = self._chain_manager.get_chain_by_index(index)
                 if not chain:
                     break
                 # Main channel ignored
                 if chain.chain_id == 0:
                     continue
-                self._leds.led_state(BTN_TRACK_1 + i, query(scene))
+                self._leds.led_state(BTN_TRACK_1 + i, query(index))
 
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
@@ -943,6 +943,12 @@ class PadMatrixHandler(BaseHandler):
         # Switch pattman function (if pattman enabled and SHIFT is not pressed)
         if state and self._pattman_func is not None and not self._is_shifted:
             btn = BTN_TRACK_1 + track
+
+            if btn == BTN_LEFT:
+                return self._change_scene(-1)
+            if btn == BTN_RIGHT:
+                return self._change_scene(1)
+
             func = {
                 BTN_KNOB_CTRL_VOLUME: FN_PATTERN_COPY,
                 BTN_KNOB_CTRL_PAN: FN_PATTERN_MOVE,
@@ -954,9 +960,10 @@ class PadMatrixHandler(BaseHandler):
 
                 # Function CLEAR does not have source sequence, remove it
                 if func == FN_PATTERN_CLEAR and self._pattman_src_seq is not None:
-                    seq = self._pattman_src_seq
+                    scene, seq = self._pattman_src_seq
                     self._pattman_src_seq = None
-                    self._update_pad(seq)
+                    if scene == self._zynseq.bank:
+                        self._update_pad(seq)
 
     def on_screen_change(self, screen):
         self._current_screen = screen
@@ -1016,7 +1023,7 @@ class PadMatrixHandler(BaseHandler):
         if self._pattman_func is not None:
             self._pattman_handle_pad_press(seq)
         elif self._track_btn_pressed is not None:
-            self._clear_pattern(seq)
+            self._clear_pattern((self._zynseq.bank, seq))
         elif self._is_shifted:
             self._show_pattern_editor(seq)
         elif self._is_record_pressed:
@@ -1043,8 +1050,10 @@ class PadMatrixHandler(BaseHandler):
         if self._pattman_func is not None:
             led_mode = LED_BRIGHT_25 if is_empty else LED_BRIGHT_100
             if (self._pattman_func in (FN_PATTERN_COPY, FN_PATTERN_MOVE)
-                    and seq == self._pattman_src_seq):
-                led_mode = LED_BLINKING_24
+                    and self._pattman_src_seq is not None):
+                src_scene, src_seq = self._pattman_src_seq
+                if src_scene == self._zynseq.bank and src_seq == seq:
+                    led_mode = LED_BLINKING_24
 
         # Otherwise, update according to sequence state
         else:
@@ -1087,16 +1096,16 @@ class PadMatrixHandler(BaseHandler):
         seq_is_empty = self._libseq.isEmpty(self._zynseq.bank, seq)
         if self._pattman_func == FN_PATTERN_CLEAR:
             if not seq_is_empty:
-                self._clear_pattern(seq)
+                self._clear_pattern((self._zynseq.bank, seq))
             return
 
         # Set selected sequence as source
         if self._pattman_src_seq is None:
             if not seq_is_empty:
-                self._pattman_src_seq = seq
+                self._pattman_src_seq = (self._zynseq.bank, seq)
         else:
             # Clear source sequence
-            if self._pattman_src_seq == seq:
+            if self._pattman_src_seq == (self._zynseq.bank, seq):
                 self._pattman_src_seq = None
             # Copy/Move source to selected sequence (will be overwritten)
             else:
@@ -1108,6 +1117,12 @@ class PadMatrixHandler(BaseHandler):
                     self._pattman_src_seq = None
 
         self._update_pad(seq)
+
+    def _change_scene(self, offset):
+        scene = min(64, max(1, self._zynseq.bank + offset))
+        if scene != self._zynseq.bank:
+            self._zynseq.select_bank(scene)
+            self._state_manager.send_cuia("SCREEN_ZYNPAD")
 
     def _update_pad(self, seq, refresh=True):
         state = self._libseq.getSequenceState(self._zynseq.bank, seq)
@@ -1177,14 +1192,16 @@ class PadMatrixHandler(BaseHandler):
         self.refresh()
 
     def _clear_pattern(self, seq):
-        pattern = self._libseq.getPattern(self._zynseq.bank, seq, 0, 0)
+        scene, seq = seq
+        pattern = self._libseq.getPattern(scene, seq, 0, 0)
         self._libseq.selectPattern(pattern)
         self._libseq.clear()
         self._libseq.updateSequenceInfo()
         self._update_pad(seq)
 
     def _copy_pattern(self, src, dst):
-        patt_src = self._libseq.getPattern(self._zynseq.bank, src, 0, 0)
+        scene_src, seq_src = src
+        patt_src = self._libseq.getPattern(scene_src, seq_src, 0, 0)
         patt_dst = self._libseq.getPattern(self._zynseq.bank, dst, 0, 0)
         self._libseq.copyPattern(patt_src, patt_dst)
         self._libseq.updateSequenceInfo()
