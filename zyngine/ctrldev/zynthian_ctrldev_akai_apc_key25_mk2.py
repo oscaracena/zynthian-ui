@@ -23,7 +23,15 @@
 #
 #******************************************************************************
 
+# FIXME: Add support for:
+# - sequences with more than one track
+# - sequences with more thant one pattern
+# - patterns that has offsets
+
 import time
+import multiprocessing as mp
+import signal
+import jack
 from bisect import bisect
 from functools import partial
 from threading import Thread, RLock, Event
@@ -41,12 +49,14 @@ from zynlibs.zynseq import zynseq
 EV_NOTE_ON                           = 0x09
 EV_NOTE_OFF                          = 0x08
 EV_CC                                = 0x0B
+EV_CLOCK                             = 0xF8
+EV_CONTINUE                          = 0xFB
 
 # APC Key25 buttons
 BTN_SHIFT                            = 0x62
 BTN_STOP_ALL_CLIPS                   = 0x51
-BTN_PLAY                             = 0x5b
-BTN_RECORD                           = 0x5d
+BTN_PLAY                             = 0x5B
+BTN_RECORD                           = 0x5D
 
 BTN_TRACK_1 = BTN_UP                 = 0x40
 BTN_TRACK_2 = BTN_DOWN               = 0x41
@@ -140,8 +150,8 @@ FN_SCENE                             = 0x07
 
 FN_PATTERN_MANAGER                   = 0x08
 FN_PATTERN_COPY                      = 0x09
-FN_PATTERN_MOVE                      = 0x0a
-FN_PATTERN_CLEAR                     = 0x0b
+FN_PATTERN_MOVE                      = 0x0A
+FN_PATTERN_CLEAR                     = 0x0B
 
 PT_SHORT                             = "short"
 PT_BOLD                              = "bold"
@@ -162,6 +172,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         self._device_handler = DeviceHandler(state_manager, self._leds)
         self._mixer_handler = MixerHandler(state_manager, self._leds)
         self._padmatrix_handler = PadMatrixHandler(state_manager, self._leds)
+        self._stepseq_handler = StepSeqHandler(state_manager, self._leds)
         self._current_handler = self._mixer_handler
         self._is_shifted = False
 
@@ -215,12 +226,19 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                 return self._on_shift_changed(True)
 
             if self._is_shifted:
+                old_handler = self._current_handler
                 # Change global mode here
                 if note == BTN_KNOB_CTRL_DEVICE:
                     self._current_handler = self._device_handler
                 elif note in [BTN_KNOB_CTRL_PAN, BTN_KNOB_CTRL_VOLUME]:
                     self._current_handler = self._mixer_handler
                     self._padmatrix_handler.refresh()
+                elif note == BTN_KNOB_CTRL_SEND:
+                    self._current_handler = self._stepseq_handler
+
+                if old_handler != self._current_handler:
+                    old_handler.set_active(False)
+                    self._current_handler.set_active(True)
 
                 # Change sub-modes here
                 elif note == BTN_SOFT_KEY_CLIP_STOP:
@@ -232,7 +250,21 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
             # Padmatrix related events
             if self._current_handler == self._mixer_handler:
                 if BTN_PAD_START <= note <= BTN_PAD_END:
-                    return self._padmatrix_handler.pad_press(note)
+
+                    # Launch StepSeq directly from SHIFT + PAD
+                    if self._is_shifted:
+                        seq = self._padmatrix_handler.get_sequence_from_pad(note)
+                        if seq is not None:
+                            if self._current_handler != self._stepseq_handler:
+                                self._current_handler.set_active(False)
+                            self._current_handler = self._stepseq_handler
+                            self._current_handler.set_sequence(seq)
+                            self._current_handler.set_active(True)
+                            self._current_handler.refresh(shifted_override=self._is_shifted)
+                    else:
+                        self._padmatrix_handler.pad_press(note)
+                    return
+
                 elif note == BTN_RECORD and not self._is_shifted:
                     return self._padmatrix_handler.on_record_changed(True)
                 elif note == BTN_PLAY:
@@ -414,9 +446,13 @@ class BaseHandler:
         self._zynseq = state_manager.zynseq
 
         self._is_shifted = False
+        self._is_active = False
 
     def refresh(self):
         pass
+
+    def set_active(self, active):
+        self._is_active = active
 
     def note_on(self, note, shifted_override=None):
         pass
@@ -1011,21 +1047,17 @@ class PadMatrixHandler(BaseHandler):
             self._btn_timer.is_released(note)
 
     def pad_press(self, pad):
-        index = self._pads.index(pad)
-        col = index // self._rows
-        row = index % self._rows
-
         # Pad outside grid, discarded
-        if col >= self._zynseq.col_in_bank or row >= self._zynseq.col_in_bank:
+        seq = self.get_sequence_from_pad(pad)
+        if seq is None:
             return True
 
-        seq = col * self._zynseq.col_in_bank + row
         if self._pattman_func is not None:
             self._pattman_handle_pad_press(seq)
         elif self._track_btn_pressed is not None:
             self._clear_pattern((self._zynseq.bank, seq))
-        elif self._is_shifted:
-            self._show_pattern_editor(seq)
+        # elif self._is_shifted:
+        #     self._show_pattern_editor(seq)
         elif self._is_record_pressed:
             self._start_pattern_record(seq)
         elif self._recording_seq == seq:
@@ -1073,6 +1105,16 @@ class PadMatrixHandler(BaseHandler):
         if refresh:
             self._refresh_tool_buttons()
 
+    def get_sequence_from_pad(self, pad):
+        index = self._pads.index(pad)
+        col = index // self._rows
+        row = index % self._rows
+
+        # Pad outside grid, discarded
+        if col >= self._zynseq.col_in_bank or row >= self._zynseq.col_in_bank:
+            return None
+        return col * self._zynseq.col_in_bank + row
+
     def _handle_timed_button(self, btn, ptype):
         if btn == BTN_STOP_ALL_CLIPS:
             if ptype == PT_LONG:
@@ -1092,6 +1134,7 @@ class PadMatrixHandler(BaseHandler):
 
         # FIXME: if pattern editor is open, and showing affected seq, update it!
         # FIXME: if Zynpad is open, also update it!
+        # You can use self._current_screen...
 
         seq_is_empty = self._libseq.isEmpty(self._zynseq.bank, seq)
         if self._pattman_func == FN_PATTERN_CLEAR:
@@ -1221,3 +1264,246 @@ class PadMatrixHandler(BaseHandler):
     def _select_pad(self, pad):
         # FIXME: this SHOULD be a CUIA, not this hack! (is coupled with UI)
         zynthian_gui_config.zyngui.screens["zynpad"].select_pad(pad)
+
+
+# --------------------------------------------------------------------------
+#  Jack client for playback sync
+# --------------------------------------------------------------------------
+#
+# NOTE: This is not a thread to avoid overloading the whole system
+# FIXME: make this a C service and use a FIFO for IPC
+#        or a library with a thead accessed using ctypes
+#        https://docs.python.org/3.7/library/ctypes.html
+class StepSyncProvider(mp.Process):
+    def __init__(self, steps_per_beat, step_callback):
+        """NOTE: This constructor will be called in the old process."""
+        super().__init__()
+        self._commands = mp.Queue()
+        self._steps = mp.Queue()
+        self._spb = steps_per_beat
+        self._tick_counter = 0
+
+        # Create a new thread to read steps and call sync callback
+        StepSyncConsumer(self._steps, step_callback)
+
+        # IPC methods
+        self.enable = partial(self._enqueue_cmd, "enable", True)
+        self.disable = partial(self._enqueue_cmd, "enable", False)
+        self.stop = partial(self._enqueue_cmd, "stop")
+        self.set_steps_per_beat = partial(self._enqueue_cmd, "spb")
+
+        self.daemon = True
+        self.start()
+
+    def _init(self):
+        """NOTE: This _init() is called inside the new process."""
+        signal.signal(signal.SIGINT, self._on_interrupt)
+        signal.signal(signal.SIGTERM, self._on_interrupt)
+        signal.signal(signal.SIGHUP, self._on_interrupt)
+
+    # Process worker
+    def run(self):
+        self._init()
+
+        self._jack_client = jack.Client("StepSeq-Monitor")
+        self._inport = self._jack_client.midi_inports.register("input")
+        self._jack_client.set_process_callback(self._process)
+
+        # Process incoming messages
+        while True:
+            cmd = self._commands.get()
+            print(f"CMD: {cmd}")
+            if cmd[0] == "stop":
+                break
+            if cmd[0] == "spb":
+                self._spb = cmd[1]
+            elif cmd[0] == "enable":
+                self._cmd_enable(cmd[1])
+
+    # Internal commands
+    def _cmd_enable(self, enable):
+        if enable:
+            self._tick_counter = 0
+            self._jack_client.activate()
+            self._jack_client.connect("zynseq:output", self._inport)
+        else:
+            self._jack_client.deactivate()
+
+    # For simple IPC methods
+    def _enqueue_cmd(self, cmd, *args):
+        self._commands.put([cmd] + list(args))
+
+    def _on_interrupt(self, signum, frame):
+        if self._jack_client:
+            self._jack_client.deactivate()
+            self._jack_client.close()
+            self._jack_client = None
+        self.stop()
+
+    # Jack events processor
+    def _process(self, nframes):
+        for offset, data in self._inport.incoming_midi_events():
+            data = bytes(data)
+            ev = data[0]
+
+            # 'Continue' is sent on every bar end
+            if ev == EV_CONTINUE:
+                self._steps.put("B")
+
+            # 24 'Clock' events for each beat (quarter note)
+            elif ev == EV_CLOCK:
+                self._tick_counter += 1
+                if self._tick_counter >= 24 / self._spb:
+                    self._steps.put("S")
+                    self._tick_counter = 0
+
+
+# --------------------------------------------------------------------------
+#  Step Sequencer clock sync
+# --------------------------------------------------------------------------
+class StepSyncConsumer(Thread):
+    def __init__(self, event_queue, callback):
+        super().__init__()
+        self._events = event_queue
+        self._callback = callback
+
+        self.daemon = True
+        self.start()
+
+    def run(self):
+        while True:
+            ev = self._events.get()
+            self._callback(ev)
+
+
+# --------------------------------------------------------------------------
+#  Step Sequencer mode (StepSeq)
+# --------------------------------------------------------------------------
+class StepSeqHandler(BaseHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._libseq = self._zynseq.libseq
+        self._cursor = 0
+
+        spb = self._libseq.getStepsPerBeat()
+        self._clock = StepSyncProvider(spb, self._on_next_step)
+        self._selected_seq = None
+        self._selected_pattern = None
+        self._pads_shown = 32
+
+        # We need to receive clock though MIDI
+        self._libseq.enableMidiClockOutput(True)
+
+        # Pads ordered for cursor sliding
+        self._step_pads = []
+        for r in range(4):
+            for c in reversed(range(8)):
+                self._step_pads.append(BTN_PAD_END - (r * 8 + c))
+
+    def set_active(self, active):
+        super().set_active(active)
+        self._update_for_selected_pattern()
+        self._clock.enable() if active else self._clock.disable()
+
+    def refresh(self, shifted_override=None):
+        self._on_shifted_override(shifted_override)
+        print("refresh")
+        self._leds.all_off()
+
+        # If SHIFT is pressed, show this mode as active
+        if self._is_shifted:
+            self._leds.led_on(BTN_KNOB_CTRL_SEND)
+
+    def set_sequence(self, seq):
+        print("sequece selected:", seq)
+        self._selected_seq = seq
+
+        patterns = self._get_sequence_patterns(seq, create=True)
+        self._libseq.setSequence(self._selected_seq)
+        self._set_pattern(patterns[0])
+
+    def on_shift_changed(self, state):
+        retval = super().on_shift_changed(state)
+        self.refresh()
+        return retval
+
+    def note_on(self, note, shifted_override=None):
+        print(f"note on {note}")
+        self._on_shifted_override(shifted_override)
+
+        if self._is_shifted:
+            # Just changed to this mode, perform a refresh
+            if note == BTN_KNOB_CTRL_SEND:
+                self.refresh()
+                return True
+
+        else:
+            if note == BTN_PLAY:
+                return self._libseq.togglePlayState(self._zynseq.bank, self._selected_seq)
+
+    def note_off(self, note, shifted_override=None):
+        print(f"note off {note}")
+
+    def cc_change(self, ccnum, ccval):
+        print(f"cc change, {ccnum}:{ccval}")
+
+    def _on_next_step(self, ev):
+        if not self._is_active:
+            return
+
+        self._leds.led_off(self._step_pads[self._cursor])
+
+        # On step event, move cursor to next step
+        if ev == "S":
+            self._cursor = (self._cursor + 1) % self._pads_shown
+        # On bar event, reset cursor position
+        elif ev == "B":
+            self._cursor = 0
+
+        self._leds.led_on(self._step_pads[self._cursor], COLOR_WHITE, LED_BRIGHT_50)
+
+    def _update_for_selected_pattern(self):
+        spb = self._libseq.getStepsPerBeat()
+        bip = self._libseq.getBeatsInPattern()
+        self._clock.set_steps_per_beat(spb)
+        steps = spb * bip
+        self._pads_shown = min(32, steps)
+        self._cursor = self._libseq.getPatternPlayhead()
+        print("PLAY HEAD", self._cursor)
+
+    def _set_pattern(self, pattern):
+        self._selected_pattern = pattern
+        self._libseq.selectPattern(self._selected_pattern)
+        self._update_for_selected_pattern()
+
+    def _get_sequence_patterns(self, seq, create=False):
+        # FIXME: Track's getNextPattern() would be awesome here...
+        seq_len = self._libseq.getSequenceLength(self._zynseq.bank, seq)
+        pattern = -1
+        retval = []
+
+        # If there are no patterns...
+        if seq_len == 0:
+            if create:
+                pattern = self._libseq.createPattern()
+                self._libseq.addPattern(self._zynseq.bank, seq, 0, 0, pattern)
+                retval.append(pattern)
+            return retval
+
+        # Otherwise, search for first pattern in sequence
+        n_tracks = self._libseq.getTracksInSequence(self._zynseq.bank, seq)
+        for track in range(n_tracks):
+            n_patts = self._libseq.getPatternsInTrack(self._zynseq.bank, seq, track)
+            if n_patts == 0:
+                continue
+            pos = 0
+            while pos < seq_len:
+                pattern = self._libseq.getPatternAt(self._zynseq.bank, seq, track, pos)
+                if pattern != -1:
+                    retval.append(pattern)
+                    pos += self._libseq.getPatternLength(pattern)
+                else:
+                    # Arranger offset step is a quarter note (24 clocks)
+                    pos += 24
+
+        return retval
