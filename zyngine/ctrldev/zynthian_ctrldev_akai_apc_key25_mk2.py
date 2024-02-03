@@ -154,6 +154,9 @@ FN_PATTERN_COPY                      = 0x09
 FN_PATTERN_MOVE                      = 0x0A
 FN_PATTERN_CLEAR                     = 0x0B
 
+FN_PLAY_NOTE                         = 0x0C
+FN_REMOVE_NOTE                       = 0x0D
+
 PT_SHORT                             = "short"
 PT_BOLD                              = "bold"
 PT_LONG                              = "long"
@@ -268,6 +271,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                         self._padmatrix_handler.pad_press(note)
                     return
 
+                # FIXME: move these events to padmatrix handler itself
                 elif note == BTN_RECORD and not self._is_shifted:
                     return self._padmatrix_handler.on_record_changed(True)
                 elif note == BTN_PLAY:
@@ -1091,7 +1095,11 @@ class PadMatrixHandler(BaseHandler):
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None, refresh=True):
         col, row = self._zynseq.get_xy_from_pad(seq)
-        btn = self._pads[col * self._rows + row]
+        idx = col * self._rows + row
+        if idx >= len(self._pads):
+            print("Invalid index!")
+            return
+        btn = self._pads[idx]
         pattern = self._libseq.getPattern(bank, seq, 0, 0)
         is_empty = self._zynseq.is_pattern_empty(pattern)
         color = self.GROUP_COLORS[group]
@@ -1423,10 +1431,11 @@ class StepSeqHandler(BaseHandler):
 
         # 'Note-Pad' mapping
         self._note_pads = {}
+        self._note_pads_function = FN_PLAY_NOTE
 
         # FIXME: just for developing, remove!
-        self._note_pads = {0:48, 1:69, 3:60}
-        self._selected_note = 60
+        # self._note_pads = {0:48, 1:69, 3:60}
+        # self._selected_note = 60
         # FIXME
 
         self._pressed_pads = set()
@@ -1436,6 +1445,7 @@ class StepSeqHandler(BaseHandler):
         super().set_active(active)
         self._update_for_selected_pattern()
         self._clock.enable() if active else self._clock.disable()
+        self._pressed_pads_action = "activation"
 
     def refresh(self, shifted_override=None):
         self._on_shifted_override(shifted_override)
@@ -1501,11 +1511,19 @@ class StepSeqHandler(BaseHandler):
                 self._pressed_pads.add(note)
                 if BTN_PAD_START <= note <= BTN_PAD_START + 7:
                     if not self._is_shifted:
-                        self._play_instrument_on(note, velocity)
-                        self._enable_midi_listening(True)
+                        self._run_note_pad_action(note, velocity, True)
+            elif note == BTN_STOP_ALL_CLIPS:
+                self._note_pads_function = FN_REMOVE_NOTE
             else:
                 return False
             return True
+
+    def _run_note_pad_action(self, note, velocity=None, state=True):
+        if self._note_pads_function == FN_PLAY_NOTE:
+            self._play_instrument(note, velocity, on=state)
+            self._enable_midi_listening(state)
+        elif self._note_pads_function == FN_REMOVE_NOTE:
+            self._remove_note_pad(note)
 
     def note_off(self, note, shifted_override=None):
         self._on_shifted_override(shifted_override)
@@ -1513,8 +1531,7 @@ class StepSeqHandler(BaseHandler):
         if BTN_PAD_START <= note <= BTN_PAD_END:
             if BTN_PAD_START <= note <= BTN_PAD_START + 7:
                 if not self._is_shifted:
-                    self._play_instrument_off(note)
-                    self._enable_midi_listening(False)
+                    self._run_note_pad_action(note, state=False)
             elif note in self._step_pads[:self._used_pads] \
                     and self._pressed_pads_action is None:
                 self._toggle_step(self._step_pads.index(note))
@@ -1523,6 +1540,8 @@ class StepSeqHandler(BaseHandler):
                 self._pressed_pads.discard(note)
             if not self._pressed_pads:
                 self._pressed_pads_action = None
+        elif note == BTN_STOP_ALL_CLIPS:
+            self._note_pads_function = FN_PLAY_NOTE
         else:
             return False
         return True
@@ -1545,6 +1564,9 @@ class StepSeqHandler(BaseHandler):
         print(f"timed button: {btn}, {press_type}")
 
     def _update_step_velocity(self, step, delta):
+        if self._selected_note is None:
+            return
+
         vel = self._libseq.getNoteVelocity(step, self._selected_note) + delta
         vel = min(127, max(10, vel))
         self._libseq.setNoteVelocity(step, self._selected_note, vel)
@@ -1581,19 +1603,18 @@ class StepSeqHandler(BaseHandler):
             self._selected_note = note
             self.refresh()
 
-    def _play_instrument_on(self, pad, velocity):
+    def _play_instrument(self, pad, velocity, on=True):
         note = self._note_pads.get(pad - BTN_PAD_START)
         if note is not None:
             chan = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
-            self._libseq.playNote(note, velocity, chan, 60000)
-
-    def _play_instrument_off(self, pad):
-        note = self._note_pads.get(pad - BTN_PAD_START)
-        if note is not None:
-            chan = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
-            self._libseq.playNote(note, 0, chan, 0)
+            velocity = velocity if on else 0
+            duration = 60000 if on else 0
+            self._libseq.playNote(note, velocity, chan, duration)
 
     def _toggle_step(self, step):
+        if self._selected_note is None:
+            return
+
         self._libseq.selectPattern(self._selected_pattern)
         if self._libseq.getNoteStart(step, self._selected_note) == -1:
             vel = 100 if not self._is_shifted else 45
