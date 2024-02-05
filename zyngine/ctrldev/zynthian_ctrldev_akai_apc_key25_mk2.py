@@ -35,6 +35,7 @@ import jack
 from math import ceil
 from bisect import bisect
 from functools import partial
+from copy import deepcopy
 from threading import Thread, RLock, Event
 from zyngine.ctrldev.zynthian_ctrldev_base import (
     zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
@@ -211,40 +212,23 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
 
-        # FIXME: just for developing, remove!
-        self.set_state({
-            "stepseq": {
-                "seqs": {
-                    0: (2, 3),               # sequence: instrument_page, selected note
-                                             # (missing -> page 0, note 0)
-                },
-                "chains": [
-                    {
-                        "index": 0,          # chain id (do not use a list as chains move)
-                        "pages": {           # up to 4 pages (0-3)
-                            0: [
-                                (60, 127),   # note, velocity
-                                None,        # skip pad (no note here)
-                                (60, 30),
-                            ],
-                                             # page 1 does not have note-pads
-                            2: [
-                                (55, 100),
-                                None,
-                                None,
-                                (61, 60),
-                            ]
-                        }
-                    },
-                                             # other chains here
-                ]
-            }
-        })
+        #!FIXME: just for developing, remove!
+        from pathlib import Path
+        import json
+        saved = Path("/root/step-seq-save-test.json")
+        if saved.exists():
+            self.set_state(json.load(saved.open()))
 
     def end(self):
         for signal, subsignal, callback in self._signals:
             zynsigman.unregister(signal, subsignal, callback)
         super().end()
+
+        #!FIXME: just for developing, remove!
+        from pathlib import Path
+        import json
+        with Path("/root/step-seq-save-test.json").open("w") as dst:
+            json.dump(self.get_state(), dst, indent=4)
 
     def refresh(self):
         # PadMatrix is handled in volume/pan modes (when mixer handler is active)
@@ -1520,14 +1504,50 @@ class StepSyncConsumer(Thread):
 
 
 # --------------------------------------------------------------------------
+#  Class to marshall/un-marshall saved state of StepSeq
+# --------------------------------------------------------------------------
+class StepSeqState:
+    def __init__(self):
+        self._seqs = {}
+        self._chains = {}
+
+    def load(self, state):
+        state = deepcopy(state)
+        self._seqs = state.get("seqs", {})
+        self._chains = state.get("chains", {})
+
+        # Convert JSON stringfied key ints as real ints
+        for c in self._chains.values():
+            src_pages = c.get("pages", [])
+            dst_pages = []
+            for p in src_pages:
+                dst_pages.append({int(k):v for k,v in p.items()})
+            c["pages"] = dst_pages
+
+    def save(self):
+        return {"seqs": self._seqs, "chains": self._chains}
+
+    def get_chain_by_id(self, chain_id):
+        chain_id = str(chain_id) if chain_id is not None else "default"
+        chain = self._chains.get(chain_id)
+        if chain is None:
+            chain = {"pages": [{}, {}, {}, {}]}
+            self._chains[chain_id] = chain
+        return chain
+
+    def get_page_by_sequence(self, seq):
+        return 0, 0
+
+
+# --------------------------------------------------------------------------
 #  Step Sequencer mode (StepSeq)
 # --------------------------------------------------------------------------
 class StepSeqHandler(BaseHandler):
     NOTE_PAGE_COLORS = [
         COLOR_BLUE,
         COLOR_GREEN,
-        COLOR_PINK,
         COLOR_ORANGE,
+        COLOR_PINK,
     ]
 
     def __init__(self, state_manager, leds, dev_idx):
@@ -1535,10 +1555,10 @@ class StepSeqHandler(BaseHandler):
         self._libseq = self._zynseq.libseq
         self._own_device_id = dev_idx
         self._cursor = 0
+        self._saved_state = StepSeqState()
 
         spb = self._libseq.getStepsPerBeat()
         self._clock = StepSyncProvider(spb, self._on_next_step)
-        self._btn_timer = ButtonTimer(self._handle_timed_button)
         self._selected_seq = None
         self._selected_pattern = None
         self._selected_note = None
@@ -1565,13 +1585,17 @@ class StepSeqHandler(BaseHandler):
         state = state.get("stepseq")
         if state is None:
             return
+        self._saved_state.load(state)
 
     def get_state(self):
-        return {}
+        return {"stepseq": self._saved_state.save()}
 
     def set_active(self, active):
         super().set_active(active)
-        self._update_for_selected_pattern()
+        if self._selected_seq is None:
+            self.set_sequence(0)
+        else:
+            self._update_for_selected_pattern()
         self._clock.enable() if active else self._clock.disable()
         self._pressed_pads_action = "activation"
 
@@ -1609,10 +1633,16 @@ class StepSeqHandler(BaseHandler):
             self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
 
     def set_sequence(self, seq):
+        self._libseq.setSequence(seq)
         self._selected_seq = seq
         patterns = self._get_sequence_patterns(seq, create=True)
-        self._libseq.setSequence(self._selected_seq)
         self._set_pattern(patterns[0])
+
+        # Update active chain and instruments page
+        chan = self._libseq.getChannel(self._zynseq.bank, seq, 0)
+        chain_id = self._get_chain_id_by_midi_chan(chan)
+        self._chain_manager.set_active_chain_by_id(chain_id)
+        self._update_instruments(seq, chain_id)
 
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
@@ -1692,9 +1722,6 @@ class StepSeqHandler(BaseHandler):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
             self._leds.led_off(self._pads[self._cursor], overlay=True)
 
-    def _handle_timed_button(self, btn, press_type):
-        print(f"timed button: {btn}, {press_type}")
-
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
             return
@@ -1755,6 +1782,15 @@ class StepSeqHandler(BaseHandler):
         indicator = BTN_TRACK_1 + self._note_page_number
         self._leds.led_on(indicator)
         self._leds.delayed("led_off", 1000, indicator)
+
+    def _update_instruments(self, seq, chain_id):
+        saved_chain = self._saved_state.get_chain_by_id(chain_id)
+        self._note_pages = saved_chain["pages"]
+
+        page_num, index = self._saved_state.get_page_by_sequence(seq)
+        self._note_pads = self._note_pages[page_num]
+        self._note_page_number = page_num
+        self._selected_note = self._note_pads.get(index)
 
     def _on_change_instrument(self, pad):
         note_spec = self._note_pads.get(pad - BTN_PAD_START)
@@ -1882,3 +1918,10 @@ class StepSeqHandler(BaseHandler):
                 continue
             step += 1
         return retval
+
+    def _get_chain_id_by_midi_chan(self, channel):
+        # FIXME: this shall be implemented in chain_manager...
+        return next(
+            (id for id, c in self._chain_manager.chains.items() if c.midi_chan == channel),
+            None
+        )
