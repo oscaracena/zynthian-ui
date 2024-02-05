@@ -544,20 +544,26 @@ class FeedbackLEDs:
                 self.led_on(led, *old_state)
                 return
 
+        self._timer.remove(led)
         lib_zyncore.dev_send_note_on(self._idev, 0, led, 0)
         self._state.pop(led, None)
 
     def led_on(self, led, color=1, brightness=0, overlay=False):
+        self._timer.remove(led)
         lib_zyncore.dev_send_note_on(self._idev, brightness, led, color)
         if not overlay:
             self._state[led] = (color, brightness)
 
-    def led_blink(self, led, overlay=False):
+    def led_blink(self, led):
+        self._timer.remove(led)
         lib_zyncore.dev_send_note_on(self._idev, 0, led, 2)
 
     def delayed(self, action, timeout, led, *args, **kwargs):
         action = getattr(self, action)
         self._timer.add(led, timeout, action, *args, **kwargs)
+
+    def clear_delayed(self, led):
+        self._timer.remove(led)
 
 
 # --------------------------------------------------------------------------
@@ -1517,6 +1523,13 @@ class StepSyncConsumer(Thread):
 #  Step Sequencer mode (StepSeq)
 # --------------------------------------------------------------------------
 class StepSeqHandler(BaseHandler):
+    NOTE_PAGE_COLORS = [
+        COLOR_BLUE,
+        COLOR_GREEN,
+        COLOR_PINK,
+        COLOR_ORANGE,
+    ]
+
     def __init__(self, state_manager, leds, dev_idx):
         super().__init__(state_manager, leds)
         self._libseq = self._zynseq.libseq
@@ -1540,9 +1553,11 @@ class StepSeqHandler(BaseHandler):
             for c in reversed(range(8)):
                 self._pads.append(BTN_PAD_END - (r * 8 + c))
 
-        # 'Note-Pad' mapping
+        # 'Note-Pad' mapping (4 pages available)
         self._note_pads = {}
         self._note_pads_function = FN_PLAY_NOTE
+        self._note_pages = [self._note_pads, {}, {}, {}]
+        self._note_page_number = 0
         self._pressed_pads = set()
         self._pressed_pads_action = None
 
@@ -1582,12 +1597,13 @@ class StepSeqHandler(BaseHandler):
             pads[pad] = (COLOR_RED, int((vel * 6) / 127))
 
         # Note pads that are not empty
+        color = self.NOTE_PAGE_COLORS[self._note_page_number]
         for idx, note_spec in self._note_pads.items():
             pad = BTN_PAD_START + idx
             mode = int((note_spec[1] * 6) / 127)
             if note_spec == self._selected_note:
                 mode = LED_PULSING_8
-            pads[pad] = (COLOR_BLUE, mode)
+            pads[pad] = (color, mode)
 
         for pad, args in pads.items():
             self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
@@ -1624,16 +1640,13 @@ class StepSeqHandler(BaseHandler):
                     self._run_note_pad_action(note, state=True)
             elif note == BTN_STOP_ALL_CLIPS:
                 self._note_pads_function = FN_REMOVE_NOTE
+            elif note == BTN_LEFT:
+                self._change_instruments_page(-1)
+            elif note == BTN_RIGHT:
+                self._change_instruments_page(1)
             else:
                 return False
             return True
-
-    def _run_note_pad_action(self, note, velocity=None, state=True):
-        if self._note_pads_function == FN_PLAY_NOTE:
-            self._play_instrument(note, velocity, on=state)
-            self._enable_midi_listening(state)
-        elif self._note_pads_function == FN_REMOVE_NOTE:
-            self._remove_note_pad(note)
 
     def note_off(self, note, shifted_override=None):
         self._on_shifted_override(shifted_override)
@@ -1696,10 +1709,11 @@ class StepSeqHandler(BaseHandler):
         is_selected = (note, vel) == self._selected_note
         vel = min(127, max(10, vel + delta))
         self._note_pads[pad] = (note, vel)
-        self._leds.led_on(pad, COLOR_BLUE, int((vel * 6) / 127))
+        color = self.NOTE_PAGE_COLORS[self._note_page_number]
+        self._leds.led_on(pad, color, int((vel * 6) / 127))
         if is_selected:
             self._selected_note = (note, vel)
-            self._leds.delayed("led_on", 1500, pad, COLOR_BLUE, LED_PULSING_8)
+            self._leds.delayed("led_on", 1000, pad, color, LED_PULSING_8)
 
     def _on_midi_note_on(self, izmip, chan, note, vel):
         # Skip own device events / not assigning mode
@@ -1721,11 +1735,33 @@ class StepSeqHandler(BaseHandler):
         if self._note_pads.pop(idx, None):
             self.refresh()
 
+    def _run_note_pad_action(self, note, velocity=None, state=True):
+        if self._note_pads_function == FN_PLAY_NOTE:
+            self._play_instrument(note, velocity, on=state)
+            self._enable_midi_listening(state)
+        elif self._note_pads_function == FN_REMOVE_NOTE:
+            self._remove_note_pad(note)
+
+    def _change_instruments_page(self, offset):
+        new_page_number = max(0, min(3, self._note_page_number + offset))
+        if new_page_number == self._note_page_number:
+            return
+
+        self._note_pads = self._note_pages[new_page_number]
+        self._note_page_number = new_page_number
+        self.refresh()
+
+        # Briefly turn on a track led to indicate current page
+        indicator = BTN_TRACK_1 + self._note_page_number
+        self._leds.led_on(indicator)
+        self._leds.delayed("led_off", 1000, indicator)
+
     def _on_change_instrument(self, pad):
         note_spec = self._note_pads.get(pad - BTN_PAD_START)
-        if note_spec is not None:
-            self._selected_note = note_spec
-            self.refresh()
+        if note_spec is None:
+            return
+        self._selected_note = note_spec
+        self.refresh()
 
     def _play_instrument(self, pad, velocity=None, on=True):
         note_spec = self._note_pads.get(pad - BTN_PAD_START)
