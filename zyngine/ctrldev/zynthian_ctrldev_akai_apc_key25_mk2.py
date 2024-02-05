@@ -211,6 +211,36 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
 
+        # FIXME: just for developing, remove!
+        self.set_state({
+            "stepseq": {
+                "seqs": {
+                    0: (2, 3),               # sequence: instrument_page, selected note
+                                             # (missing -> page 0, note 0)
+                },
+                "chains": [
+                    {
+                        "index": 0,          # chain id (do not use a list as chains move)
+                        "pages": {           # up to 4 pages (0-3)
+                            0: [
+                                (60, 127),   # note, velocity
+                                None,        # skip pad (no note here)
+                                (60, 30),
+                            ],
+                                             # page 1 does not have note-pads
+                            2: [
+                                (55, 100),
+                                None,
+                                None,
+                                (61, 60),
+                            ]
+                        }
+                    },
+                                             # other chains here
+                ]
+            }
+        })
+
     def end(self):
         for signal, subsignal, callback in self._signals:
             zynsigman.unregister(signal, subsignal, callback)
@@ -327,6 +357,20 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         elif self._current_handler == self._stepseq_handler:
             self._current_handler.update_seq_state(*args, **kwargs)
 
+    def get_state(self):
+        state = {}
+        state.update(self._device_handler.get_state())
+        state.update(self._mixer_handler.get_state())
+        state.update(self._padmatrix_handler.get_state())
+        state.update(self._stepseq_handler.get_state())
+        return state
+
+    def set_state(self, state):
+        self._device_handler.set_state(state)
+        self._mixer_handler.set_state(state)
+        self._padmatrix_handler.set_state(state)
+        self._stepseq_handler.set_state(state)
+
     def _on_shift_changed(self, state):
         self._is_shifted = state
         self._current_handler.on_shift_changed(state)
@@ -405,12 +449,71 @@ class ButtonTimer(Thread):
 
 
 # --------------------------------------------------------------------------
+# A timer for running delayed actions (mostly used for feedback LEDs)
+# --------------------------------------------------------------------------
+class RunTimer(Thread):
+    def __init__(self):
+        super().__init__()
+        self._lock = RLock()
+        self._awake = Event()
+        self._actions = {}
+
+        self.daemon = True
+        self.start()
+
+    def add(self, name, timeout, callback, *args, **kwargs):
+        with self._lock:
+            self._actions[name] = [timeout, callback, name, args, kwargs]
+        self._awake.set()
+
+    def remove(self, name):
+        with self._lock:
+            self._actions.pop(name, None)
+
+    def run(self):
+        while True:
+            if not self._actions:
+                self._awake.wait()
+            self._awake.clear()
+            for action in self._get_expired():
+                self._run_action(*action[1:])
+            time.sleep(0.1)
+            self._update_timeouts(-0.1)
+
+    def _update_timeouts(self, delta):
+        delta *= 1000
+        with self._lock:
+            for action in self._actions.values():
+                action[0] += delta
+
+    def _get_expired(self):
+        retval = []
+        with self._lock:
+            to_remove = []
+            for name, spec in self._actions.items():
+                if spec[0] > 0:
+                    continue
+                to_remove.append(name)
+                retval.append(spec)
+            for name in to_remove:
+                self._actions.pop(name, None)
+        return retval
+
+    def _run_action(self, callback, name, args, kwargs):
+        try:
+            callback(name, *args, **kwargs)
+        except Exception as ex:
+            print(f" error in handler: {ex}")
+
+
+# --------------------------------------------------------------------------
 # Feedback LEDs controller
 # --------------------------------------------------------------------------
 class FeedbackLEDs:
     def __init__(self, idev):
         self._idev = idev
         self._state = {}
+        self._timer = RunTimer()
 
     def all_off(self):
         self.control_leds_off()
@@ -452,6 +555,10 @@ class FeedbackLEDs:
     def led_blink(self, led, overlay=False):
         lib_zyncore.dev_send_note_on(self._idev, 0, led, 2)
 
+    def delayed(self, action, timeout, led, *args, **kwargs):
+        action = getattr(self, action)
+        self._timer.add(led, timeout, action, *args, **kwargs)
+
 
 # --------------------------------------------------------------------------
 #  Base class for handlers
@@ -480,6 +587,12 @@ class BaseHandler:
         pass
 
     def cc_change(self, ccnum, ccval):
+        pass
+
+    def get_state(self):
+        return {}
+
+    def set_state(self, state):
         pass
 
     def on_media_change(self, media, kind, state):
@@ -1097,7 +1210,6 @@ class PadMatrixHandler(BaseHandler):
         col, row = self._zynseq.get_xy_from_pad(seq)
         idx = col * self._rows + row
         if idx >= len(self._pads):
-            print("Invalid index!")
             return
         btn = self._pads[idx]
         pattern = self._libseq.getPattern(bank, seq, 0, 0)
@@ -1338,7 +1450,6 @@ class StepSyncProvider(mp.Process):
         # Process incoming messages
         while True:
             cmd = self._commands.get()
-            # print(f"CMD: {cmd}")
             if cmd[0] == "stop":
                 break
             if cmd[0] == "spb":
@@ -1424,22 +1535,24 @@ class StepSeqHandler(BaseHandler):
         self._libseq.enableMidiClockOutput(True)
 
         # Pads ordered for cursor sliding + note pads
-        self._step_pads = []
+        self._pads = []
         for r in range(5):
             for c in reversed(range(8)):
-                self._step_pads.append(BTN_PAD_END - (r * 8 + c))
+                self._pads.append(BTN_PAD_END - (r * 8 + c))
 
         # 'Note-Pad' mapping
         self._note_pads = {}
         self._note_pads_function = FN_PLAY_NOTE
-
-        # FIXME: just for developing, remove!
-        # self._note_pads = {0:48, 1:69, 3:60}
-        # self._selected_note = 60
-        # FIXME
-
         self._pressed_pads = set()
         self._pressed_pads_action = None
+
+    def set_state(self, state):
+        state = state.get("stepseq")
+        if state is None:
+            return
+
+    def get_state(self):
+        return {}
 
     def set_active(self, active):
         super().set_active(active)
@@ -1449,7 +1562,6 @@ class StepSeqHandler(BaseHandler):
 
     def refresh(self, shifted_override=None):
         self._on_shifted_override(shifted_override)
-        # print("refresh")
         self._leds.all_off()
 
         # If SHIFT is pressed, show this mode as active
@@ -1461,19 +1573,19 @@ class StepSeqHandler(BaseHandler):
         # Dimm white for first step on each beat
         spb = self._libseq.getStepsPerBeat()
         for idx in range(0, self._used_pads, spb):
-            pad = self._step_pads[idx]
+            pad = self._pads[idx]
             pads[pad] = (COLOR_WHITE, LED_BRIGHT_10)
 
         # Red + velocity for each non-empty step
         for idx, vel in self._get_step_velocities():
-            pad = self._step_pads[idx]
+            pad = self._pads[idx]
             pads[pad] = (COLOR_RED, int((vel * 6) / 127))
 
         # Note pads that are not empty
-        for idx, note in self._note_pads.items():
+        for idx, note_spec in self._note_pads.items():
             pad = BTN_PAD_START + idx
-            mode = LED_BRIGHT_25
-            if note == self._selected_note:
+            mode = int((note_spec[1] * 6) / 127)
+            if note_spec == self._selected_note:
                 mode = LED_PULSING_8
             pads[pad] = (COLOR_BLUE, mode)
 
@@ -1481,7 +1593,6 @@ class StepSeqHandler(BaseHandler):
             self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
 
     def set_sequence(self, seq):
-        # print(f"set sequence: {seq}")
         self._selected_seq = seq
         patterns = self._get_sequence_patterns(seq, create=True)
         self._libseq.setSequence(self._selected_seq)
@@ -1510,8 +1621,7 @@ class StepSeqHandler(BaseHandler):
             elif BTN_PAD_START <= note <= BTN_PAD_END:
                 self._pressed_pads.add(note)
                 if BTN_PAD_START <= note <= BTN_PAD_START + 7:
-                    if not self._is_shifted:
-                        self._run_note_pad_action(note, velocity, True)
+                    self._run_note_pad_action(note, state=True)
             elif note == BTN_STOP_ALL_CLIPS:
                 self._note_pads_function = FN_REMOVE_NOTE
             else:
@@ -1532,9 +1642,9 @@ class StepSeqHandler(BaseHandler):
             if BTN_PAD_START <= note <= BTN_PAD_START + 7:
                 if not self._is_shifted:
                     self._run_note_pad_action(note, state=False)
-            elif note in self._step_pads[:self._used_pads] \
+            elif note in self._pads[:self._used_pads] \
                     and self._pressed_pads_action is None:
-                self._toggle_step(self._step_pads.index(note))
+                self._toggle_step(self._pads.index(note))
 
             if note in self._pressed_pads:
                 self._pressed_pads.discard(note)
@@ -1549,16 +1659,25 @@ class StepSeqHandler(BaseHandler):
     def cc_change(self, ccnum, ccval):
         delta = ccval if ccval < 64 else (ccval - 128)
         if ccnum == KNOB_1:
+            step_pads = self._pads[:self._used_pads]
             for pad in self._pressed_pads:
-                if pad not in self._step_pads[:self._used_pads]:
+                note_spec = self._note_pads.get(pad)
+                if note_spec is not None:
+                    self._update_note_pad_velocity(pad, *note_spec, delta)
                     continue
-                self._update_step_velocity(self._step_pads.index(pad), delta)
+
+                try:
+                    step = step_pads.index(pad)
+                    self._update_step_velocity(step, delta)
+                except ValueError:
+                    pass
+
             if self._pressed_pads:
                 self._pressed_pads_action = FN_VOLUME
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
-            self._leds.led_off(self._step_pads[self._cursor], overlay=True)
+            self._leds.led_off(self._pads[self._cursor], overlay=True)
 
     def _handle_timed_button(self, btn, press_type):
         print(f"timed button: {btn}, {press_type}")
@@ -1567,15 +1686,20 @@ class StepSeqHandler(BaseHandler):
         if self._selected_note is None:
             return
 
-        vel = self._libseq.getNoteVelocity(step, self._selected_note) + delta
+        vel = self._libseq.getNoteVelocity(step, self._selected_note[0]) + delta
         vel = min(127, max(10, vel))
-        self._libseq.setNoteVelocity(step, self._selected_note, vel)
-        self._refresh_steps([(step, vel)])
+        self._libseq.setNoteVelocity(step, self._selected_note[0], vel)
+        pad = self._pads[step]
+        self._leds.led_on(pad, COLOR_RED, int((vel * 6) / 127))
 
-    def _refresh_steps(self, velocities):
-        for idx, vel in velocities:
-            pad = self._step_pads[idx]
-            self._leds.led_on(pad, COLOR_RED, int((vel * 6) / 127))
+    def _update_note_pad_velocity(self, pad, note, vel, delta):
+        is_selected = (note, vel) == self._selected_note
+        vel = min(127, max(10, vel + delta))
+        self._note_pads[pad] = (note, vel)
+        self._leds.led_on(pad, COLOR_BLUE, int((vel * 6) / 127))
+        if is_selected:
+            self._selected_note = (note, vel)
+            self._leds.delayed("led_on", 1500, pad, COLOR_BLUE, LED_PULSING_8)
 
     def _on_midi_note_on(self, izmip, chan, note, vel):
         # Skip own device events / not assigning mode
@@ -1589,7 +1713,7 @@ class StepSeqHandler(BaseHandler):
             return
 
         for pad in self._pressed_pads:
-            self._note_pads[pad] = note
+            self._note_pads[pad] = (note, vel)
         self.refresh()
 
     def _remove_note_pad(self, pad):
@@ -1598,13 +1722,21 @@ class StepSeqHandler(BaseHandler):
             self.refresh()
 
     def _on_change_instrument(self, pad):
-        note = self._note_pads.get(pad - BTN_PAD_START)
-        if note is not None:
-            self._selected_note = note
+        note_spec = self._note_pads.get(pad - BTN_PAD_START)
+        if note_spec is not None:
+            self._selected_note = note_spec
             self.refresh()
 
-    def _play_instrument(self, pad, velocity, on=True):
-        note = self._note_pads.get(pad - BTN_PAD_START)
+    def _play_instrument(self, pad, velocity=None, on=True):
+        note_spec = self._note_pads.get(pad - BTN_PAD_START)
+        if note_spec is None:
+            return
+        note, vel = note_spec
+
+        # Perform's velocity takes precedence over stored velocity
+        if velocity is None:
+            velocity = vel
+
         if note is not None:
             chan = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
             velocity = velocity if on else 0
@@ -1615,21 +1747,22 @@ class StepSeqHandler(BaseHandler):
         if self._selected_note is None:
             return
 
+        note, vel = self._selected_note
         self._libseq.selectPattern(self._selected_pattern)
-        if self._libseq.getNoteStart(step, self._selected_note) == -1:
-            vel = 100 if not self._is_shifted else 45
-            self._libseq.addNote(step, self._selected_note, vel, 1)
+        if self._libseq.getNoteStart(step, note) == -1:
+            vel = vel if not self._is_shifted else vel // 2
+            self._libseq.addNote(step, note, vel, 1)
         else:
-            self._libseq.removeNote(step, self._selected_note)
+            self._libseq.removeNote(step, note)
             channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
-            self._libseq.playNote(self._selected_note, 0, channel, 0)
+            self._libseq.playNote(note, 0, channel, 0)
         self.refresh()
 
     def _on_next_step(self, ev):
         if not self._is_active:
             return
         if self._cursor < self._used_pads:
-            self._leds.led_off(self._step_pads[self._cursor], overlay=True)
+            self._leds.led_off(self._pads[self._cursor], overlay=True)
         self._cursor = self._get_pattern_playhead()
 
         # Avoid turning on the first LED when is stopping
@@ -1637,7 +1770,7 @@ class StepSeqHandler(BaseHandler):
         if self._cursor == 0 and state != zynseq.SEQ_PLAYING:
             return
         if self._cursor < self._used_pads:
-            pad = self._step_pads[self._cursor]
+            pad = self._pads[self._cursor]
             self._leds.led_on(pad, COLOR_WHITE, LED_BRIGHT_50, overlay=True)
 
     def _enable_midi_listening(self, active=True):
@@ -1649,7 +1782,6 @@ class StepSeqHandler(BaseHandler):
         bip = self._libseq.getBeatsInPattern()
         self._clock.set_steps_per_beat(spb)
 
-        # FIXME: implement some kind of scrolling
         steps = spb * bip
         self._used_pads = min(32, steps)
         self._cursor = self._get_pattern_playhead()
@@ -1661,7 +1793,6 @@ class StepSeqHandler(BaseHandler):
         return playpos // cps
 
     def _set_pattern(self, pattern):
-        # print(f"set pattern: {pattern}")
         self._selected_pattern = pattern
         self._libseq.selectPattern(self._selected_pattern)
         self._update_for_selected_pattern()
@@ -1703,11 +1834,12 @@ class StepSeqHandler(BaseHandler):
             return retval
 
         num_steps = self._libseq.getSteps()
+        note = self._selected_note[0]
         step = 0
         while step < num_steps:
-            duration = self._libseq.getNoteDuration(step, self._selected_note)
+            duration = self._libseq.getNoteDuration(step, note)
             if duration:
-                vel = self._libseq.getNoteVelocity(step, self._selected_note)
+                vel = self._libseq.getNoteVelocity(step, note)
                 for _ in range(ceil(duration)):
                     retval.append((step, vel))
                     step += 1
