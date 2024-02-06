@@ -468,6 +468,13 @@ class RunTimer(Thread):
             self._actions[name] = [timeout, callback, name, args, kwargs]
         self._awake.set()
 
+    def update(self, name, timeout):
+        with self._lock:
+            action = self._actions.get(name)
+            if action is None:
+                return
+            action[0] = timeout
+
     def remove(self, name):
         with self._lock:
             self._actions.pop(name, None)
@@ -1829,10 +1836,13 @@ class StepSeqHandler(BaseHandler):
         self.refresh()
 
     def _show_screen_briefly(self, screen, cuia, timeout):
+        timer_name = "change-screen"
         if screen != self._current_screen:
             self._state_manager.send_cuia(cuia)
-        self._timer.add("change-screen", timeout,
-            lambda timer_name: self._state_manager.send_cuia("BACK"))
+            self._timer.add(timer_name, timeout,
+                lambda _: self._state_manager.send_cuia("BACK"))
+        else:
+            self._timer.update(timer_name, timeout)
 
     def _remove_note_pad(self, pad):
         idx = pad - BTN_PAD_START
