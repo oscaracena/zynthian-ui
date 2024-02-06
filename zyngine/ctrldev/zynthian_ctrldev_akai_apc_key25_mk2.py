@@ -237,6 +237,19 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
             self._padmatrix_handler.refresh()
 
     def midi_event(self, ev):
+        if self._on_midi_event(ev):
+            while True:
+                action = self._current_handler.pop_action_request()
+                if not action:
+                    return True
+
+                # Add other receivers as needed
+                receiver, action, args, kwargs = action
+                if receiver == "stepseq":
+                    self._stepseq_handler.run_action(action, args, kwargs)
+        return False
+
+    def _on_midi_event(self, ev):
         evtype = (ev & 0xF00000) >> 20
         value = ev & 0x7F
 
@@ -274,16 +287,17 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                     # Launch StepSeq directly from SHIFT + PAD
                     if self._is_shifted:
                         seq = self._padmatrix_handler.get_sequence_from_pad(note)
-                        if seq is not None:
-                            if self._current_handler != self._stepseq_handler:
-                                self._current_handler.set_active(False)
-                            self._current_handler = self._stepseq_handler
-                            self._current_handler.set_sequence(seq)
-                            self._current_handler.set_active(True)
-                            self._current_handler.refresh(shifted_override=self._is_shifted)
-                    else:
-                        self._padmatrix_handler.pad_press(note)
-                    return
+                        if seq is None:
+                            return False
+                        if self._current_handler != self._stepseq_handler:
+                            self._current_handler.set_active(False)
+                        self._current_handler = self._stepseq_handler
+                        self._current_handler.set_sequence(seq)
+                        self._current_handler.set_active(True)
+                        self._current_handler.refresh(shifted_override=self._is_shifted)
+                        return True
+
+                    return self._padmatrix_handler.pad_press(note)
 
                 # FIXME: move these events to padmatrix handler itself
                 elif note == BTN_RECORD and not self._is_shifted:
@@ -554,6 +568,10 @@ class FeedbackLEDs:
 #  Base class for handlers
 # --------------------------------------------------------------------------
 class BaseHandler:
+
+    # These are actions requested to other handlers (shared between everyone)
+    _pending_actions = []
+
     def __init__(self, state_manager, leds):
         self._leds = leds
         self._state_manager = state_manager
@@ -592,9 +610,35 @@ class BaseHandler:
         self._is_shifted = state
         return True
 
+    def pop_action_request(self):
+        if not self._pending_actions:
+            return None
+        return self._pending_actions.pop(0)
+
+    def run_action(self, action, args, kwargs):
+        action = "_action_" + action.replace("-", "_")
+        action = getattr(self, action, None)
+        if callable(action):
+            try:
+                action(*args, **kwargs)
+            except Exception as ex:
+                print(f" error in handler: {ex}")
+
+    def _request_action(self, receiver, action, *args, **kwargs):
+        self._pending_actions.append((receiver, action, args, kwargs))
+
     def _on_shifted_override(self, override=None):
         if override is not None:
             self._is_shifted = override
+
+    # FIXME: could this be in chain_manager?
+    def _get_chain_id_by_sequence(self, bank, seq):
+        channel = self._libseq.getChannel(bank, seq, 0)
+        return next(
+            (id for id, c in self._chain_manager.chains.items()
+                if c.midi_chan == channel),
+            None
+        )
 
 
 # --------------------------------------------------------------------------
@@ -1181,8 +1225,6 @@ class PadMatrixHandler(BaseHandler):
             self._pattman_handle_pad_press(seq)
         elif self._track_btn_pressed is not None:
             self._clear_pattern((self._zynseq.bank, seq))
-        # elif self._is_shifted:
-        #     self._show_pattern_editor(seq)
         elif self._is_record_pressed:
             self._start_pattern_record(seq)
         elif self._recording_seq == seq:
@@ -1376,6 +1418,11 @@ class PadMatrixHandler(BaseHandler):
         patt_dst = self._libseq.getPattern(self._zynseq.bank, dst, 0, 0)
         self._libseq.copyPattern(patt_src, patt_dst)
         self._libseq.updateSequenceInfo()
+
+        # FIXME: also copy StepSeq instrument pages
+        chain_src = self._get_chain_id_by_sequence(self._zynseq.bank, seq_src)
+        chain_dst = self._get_chain_id_by_sequence(self._zynseq.bank, dst)
+        self._request_action("stepseq", "sync-chains", chain_src, chain_dst)
 
     def _show_pattern_editor(self, seq):
         # This way shows Zynpad everytime you change the sequuence (but is decoupled from UI)
@@ -1644,8 +1691,7 @@ class StepSeqHandler(BaseHandler):
         self._set_pattern(patterns[0])
 
         # Update active chain and instruments page
-        chan = self._libseq.getChannel(self._zynseq.bank, seq, 0)
-        chain_id = self._get_chain_id_by_midi_chan(chan)
+        chain_id = self._get_chain_id_by_sequence(self._zynseq.bank, seq)
         self._chain_manager.set_active_chain_by_id(chain_id)
         self._update_instruments(seq, chain_id)
 
@@ -1727,6 +1773,8 @@ class StepSeqHandler(BaseHandler):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
             self._leds.led_off(self._pads[self._cursor], overlay=True)
 
+
+
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
             return
@@ -1796,6 +1844,11 @@ class StepSeqHandler(BaseHandler):
         self._note_pads = self._note_pages[page_num]
         self._note_page_number = page_num
         self._selected_note = self._note_pads.get(index)
+
+    def _action_sync_chains(self, chain_src, chain_dst):
+        src = self._saved_state.get_chain_by_id(chain_src)
+        dst = self._saved_state.get_chain_by_id(chain_dst)
+        dst["pages"] = deepcopy(src["pages"])
 
     def _on_change_instrument(self, pad):
         index = pad - BTN_PAD_START
@@ -1926,10 +1979,3 @@ class StepSeqHandler(BaseHandler):
                 continue
             step += 1
         return retval
-
-    def _get_chain_id_by_midi_chan(self, channel):
-        # FIXME: this shall be implemented in chain_manager...
-        return next(
-            (id for id, c in self._chain_manager.chains.items() if c.midi_chan == channel),
-            None
-        )
