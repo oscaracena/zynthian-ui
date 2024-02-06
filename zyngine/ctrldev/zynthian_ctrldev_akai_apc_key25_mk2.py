@@ -382,6 +382,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
     def _on_gui_show_screen(self, screen):
         self._device_handler.on_screen_change(screen)
         self._padmatrix_handler.on_screen_change(screen)
+        self._stepseq_handler.on_screen_change(screen)
         if self._current_handler == self._device_handler:
             self._current_handler.refresh()
 
@@ -582,6 +583,7 @@ class BaseHandler:
         self._zynmixer = state_manager.zynmixer
         self._zynseq = state_manager.zynseq
 
+        self._current_screen = None
         self._is_shifted = False
         self._is_active = False
 
@@ -612,6 +614,9 @@ class BaseHandler:
     def on_shift_changed(self, state):
         self._is_shifted = state
         return True
+
+    def on_screen_change(self, screen):
+        self._current_screen = screen
 
     def pop_action_request(self):
         if not self._pending_actions:
@@ -952,6 +957,9 @@ class MixerHandler(BaseHandler):
             elif note == BTN_UP:
                 self._state_manager.send_cuia("BACK")
                 return True  # skip refresh
+            elif note == BTN_DOWN:
+                self._state_manager.send_cuia("SCREEN_ZYNPAD")
+                return True  # skip refresh
             else:
                 return False
             self.refresh()
@@ -1091,7 +1099,6 @@ class PadMatrixHandler(BaseHandler):
         self._rows = 5
         self._is_record_pressed = False
         self._track_btn_pressed = None
-        self._current_screen = None
         self._playing_seqs = set()
         self._btn_timer = ButtonTimer(self._handle_timed_button)
 
@@ -1172,9 +1179,6 @@ class PadMatrixHandler(BaseHandler):
                     self._pattman_src_seq = None
                     if scene == self._zynseq.bank:
                         self._update_pad(seq)
-
-    def on_screen_change(self, screen):
-        self._current_screen = screen
 
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
@@ -1611,6 +1615,7 @@ class StepSeqHandler(BaseHandler):
         self._own_device_id = dev_idx
         self._cursor = 0
         self._saved_state = StepSeqState()
+        self._timer = RunTimer()
 
         spb = self._libseq.getStepsPerBeat()
         self._clock = StepSyncProvider(spb, self._on_next_step)
@@ -1755,22 +1760,34 @@ class StepSeqHandler(BaseHandler):
 
     def cc_change(self, ccnum, ccval):
         delta = ccval if ccval < 64 else (ccval - 128)
+
+        # Adjust tempo
         if ccnum == KNOB_1:
-            step_pads = self._pads[:self._used_pads]
-            for pad in self._pressed_pads:
-                note_spec = self._note_pads.get(pad)
-                if note_spec is not None:
-                    self._update_note_pad_velocity(pad, *note_spec, delta)
-                    continue
+            self._show_screen_briefly(screen="tempo", cuia="TEMPO", timeout=1500)
+            delta *= 0.1 if self._is_shifted else 1
+            self._zynseq.set_tempo(self._zynseq.get_tempo() + delta)
 
-                try:
-                    step = step_pads.index(pad)
-                    self._update_step_velocity(step, delta)
-                except ValueError:
-                    pass
-
+        elif ccnum == KNOB_2:
+            # Update velocity of instrument or step
             if self._pressed_pads:
                 self._pressed_pads_action = FN_VOLUME
+                step_pads = self._pads[:self._used_pads]
+
+                for pad in self._pressed_pads:
+                    note_spec = self._note_pads.get(pad)
+                    if note_spec is not None:
+                        self._update_note_pad_velocity(pad, *note_spec, delta)
+                        continue
+                    try:
+                        step = step_pads.index(pad)
+                        self._update_step_velocity(step, delta)
+                    except ValueError:
+                        pass
+
+            # Update sequence's chain volume
+            else:
+                # FIXME: update sequence volume here!
+                pass
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
@@ -1810,6 +1827,12 @@ class StepSeqHandler(BaseHandler):
         for pad in self._pressed_pads:
             self._note_pads[pad] = (note, vel)
         self.refresh()
+
+    def _show_screen_briefly(self, screen, cuia, timeout):
+        if screen != self._current_screen:
+            self._state_manager.send_cuia(cuia)
+        self._timer.add("change-screen", timeout,
+            lambda timer_name: self._state_manager.send_cuia("BACK"))
 
     def _remove_note_pad(self, pad):
         idx = pad - BTN_PAD_START
