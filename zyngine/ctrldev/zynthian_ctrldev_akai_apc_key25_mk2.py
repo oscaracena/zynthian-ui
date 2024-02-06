@@ -1513,16 +1513,18 @@ class StepSeqState:
 
     def load(self, state):
         state = deepcopy(state)
-        self._seqs = state.get("seqs", {})
-        self._chains = state.get("chains", {})
 
         # Convert JSON stringfied key ints as real ints
+        self._chains = state.get("chains", {})
         for c in self._chains.values():
             src_pages = c.get("pages", [])
             dst_pages = []
             for p in src_pages:
                 dst_pages.append({int(k):v for k,v in p.items()})
             c["pages"] = dst_pages
+
+        for seq, value in state.get("seqs", {}).items():
+            self._seqs[int(seq)] = value
 
     def save(self):
         return {"seqs": self._seqs, "chains": self._chains}
@@ -1536,7 +1538,10 @@ class StepSeqState:
         return chain
 
     def get_page_by_sequence(self, seq):
-        return 0, 0
+        return self._seqs.get(seq, (0, 0))
+
+    def set_sequence_selection(self, seq, page, pad):
+        self._seqs[seq] = (page, pad)
 
 
 # --------------------------------------------------------------------------
@@ -1574,9 +1579,9 @@ class StepSeqHandler(BaseHandler):
                 self._pads.append(BTN_PAD_END - (r * 8 + c))
 
         # 'Note-Pad' mapping (4 pages available)
-        self._note_pads = {}
+        self._note_pads = None
         self._note_pads_function = FN_PLAY_NOTE
-        self._note_pages = [self._note_pads, {}, {}, {}]
+        self._note_pages = None
         self._note_page_number = 0
         self._pressed_pads = set()
         self._pressed_pads_action = None
@@ -1739,7 +1744,7 @@ class StepSeqHandler(BaseHandler):
         color = self.NOTE_PAGE_COLORS[self._note_page_number]
         self._leds.led_on(pad, color, int((vel * 6) / 127))
         if is_selected:
-            self._selected_note = (note, vel)
+            self._selected_note[1] = vel
             self._leds.delayed("led_on", 1000, pad, color, LED_PULSING_8)
 
     def _on_midi_note_on(self, izmip, chan, note, vel):
@@ -1793,10 +1798,13 @@ class StepSeqHandler(BaseHandler):
         self._selected_note = self._note_pads.get(index)
 
     def _on_change_instrument(self, pad):
-        note_spec = self._note_pads.get(pad - BTN_PAD_START)
+        index = pad - BTN_PAD_START
+        note_spec = self._note_pads.get(index)
         if note_spec is None:
             return
         self._selected_note = note_spec
+        self._saved_state.set_sequence_selection(
+            self._selected_seq, page=self._note_page_number, pad=index)
         self.refresh()
 
     def _play_instrument(self, pad, velocity=None, on=True):
