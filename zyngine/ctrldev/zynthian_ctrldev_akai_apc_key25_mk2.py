@@ -274,11 +274,11 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                     self._current_handler.set_active(True)
 
                 # Change sub-modes here
-                elif note == BTN_SOFT_KEY_CLIP_STOP:
-                    if self._current_handler == self._mixer_handler:
+                if self._current_handler == self._mixer_handler:
+                    if note == BTN_SOFT_KEY_CLIP_STOP:
                         self._padmatrix_handler.enable_pattman(True)
-                elif BTN_SOFT_KEY_CLIP_STOP < note <= BTN_SOFT_KEY_END:
-                    self._padmatrix_handler.enable_pattman(False)
+                    elif BTN_SOFT_KEY_SOLO <= note <= BTN_SOFT_KEY_END:
+                        self._padmatrix_handler.enable_pattman(False)
 
             # Padmatrix related events
             if self._current_handler == self._mixer_handler:
@@ -311,6 +311,9 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                 elif BTN_TRACK_1 <= note <= BTN_TRACK_8:
                     track = note - BTN_TRACK_1
                     self._padmatrix_handler.on_track_changed(track, True)
+                    self._current_handler.note_on(note, value, self._is_shifted)
+                    self._padmatrix_handler.refresh()
+                    return True
                 elif note == BTN_STOP_ALL_CLIPS:
                     self._padmatrix_handler.note_on(note, value, self._is_shifted)
 
@@ -1419,7 +1422,7 @@ class PadMatrixHandler(BaseHandler):
         self._libseq.copyPattern(patt_src, patt_dst)
         self._libseq.updateSequenceInfo()
 
-        # FIXME: also copy StepSeq instrument pages
+        # Also copy StepSeq instrument pages
         chain_src = self._get_chain_id_by_sequence(self._zynseq.bank, seq_src)
         chain_dst = self._get_chain_id_by_sequence(self._zynseq.bank, dst)
         self._request_action("stepseq", "sync-chains", chain_src, chain_dst)
@@ -1772,8 +1775,6 @@ class StepSeqHandler(BaseHandler):
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
             self._leds.led_off(self._pads[self._cursor], overlay=True)
-
-
 
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
