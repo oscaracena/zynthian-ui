@@ -590,6 +590,7 @@ class BaseHandler:
         self._zynmixer = state_manager.zynmixer
         self._zynseq = state_manager.zynseq
 
+        self._timer = None
         self._current_screen = None
         self._is_shifted = False
         self._is_active = False
@@ -654,6 +655,39 @@ class BaseHandler:
                 if c.midi_chan == channel),
             None
         )
+
+    def _show_screen_briefly(self, screen, cuia, timeout):
+        # Only created when/if needed
+        if self._timer is None:
+            self._timer = RunTimer()
+
+        timer_name = "change-screen"
+        prev_screen = "BACK"
+
+        # If brief screen is audio mixer, there is no back, so try to get the screen
+        # name. Not all screens may be mapped, so it will fail there (only corner-cases).
+        if screen == "audio_mixer":
+            prev_screen = {
+                "option":         "MENU",
+                "main_menu":      "MENU",
+                "admin":          "SCREEN_ADMIN",
+                "audio_mixer":    "SCREEN_AUDIO_MIXER",
+                "alsa_mixer":     "SCREEN_ALSA_MIXER",
+                "control":        "SCREEN_CONTROL",
+                "preset":         "PRESET",
+                "zs3":            "SCREEN_ZS3",
+                "snapshot":       "SCREEN_SNAPSHOT",
+                "zynpad":         "SCREEN_ZYNPAD",
+                "pattern_editor": "SCREEN_PATTERN_EDITOR",
+                "tempo":          "TEMPO",
+            }.get(self._current_screen, "BACK")
+
+        if screen != self._current_screen:
+            self._state_manager.send_cuia(cuia)
+            self._timer.add(timer_name, timeout,
+                lambda _: self._state_manager.send_cuia(prev_screen))
+        else:
+            self._timer.update(timer_name, timeout)
 
 
 # --------------------------------------------------------------------------
@@ -1434,9 +1468,8 @@ class PadMatrixHandler(BaseHandler):
         self._libseq.updateSequenceInfo()
 
         # Also copy StepSeq instrument pages
-        chain_src = self._get_chain_id_by_sequence(self._zynseq.bank, seq_src)
-        chain_dst = self._get_chain_id_by_sequence(self._zynseq.bank, dst)
-        self._request_action("stepseq", "sync-chains", chain_src, chain_dst)
+        self._request_action("stepseq", "sync-sequences",
+            scene_src, seq_src, self._zynseq.bank, dst)
 
     def _show_pattern_editor(self, seq):
         # This way shows Zynpad everytime you change the sequuence (but is decoupled from UI)
@@ -1567,6 +1600,7 @@ class StepSyncConsumer(Thread):
 # --------------------------------------------------------------------------
 #  Class to marshall/un-marshall saved state of StepSeq
 # --------------------------------------------------------------------------
+# FIXME: add support for scenes too!
 class StepSeqState:
     def __init__(self):
         self._seqs = {}
@@ -1599,10 +1633,10 @@ class StepSeqState:
         return chain
 
     def get_page_by_sequence(self, seq):
-        return self._seqs.get(seq, (0, 0))
+        return self._seqs.get(seq, [0, 0])
 
     def set_sequence_selection(self, seq, page, pad):
-        self._seqs[seq] = (page, pad)
+        self._seqs[seq] = [page, pad]
 
 
 # --------------------------------------------------------------------------
@@ -1622,7 +1656,6 @@ class StepSeqHandler(BaseHandler):
         self._own_device_id = dev_idx
         self._cursor = 0
         self._saved_state = StepSeqState()
-        self._timer = RunTimer()
 
         spb = self._libseq.getStepsPerBeat()
         self._clock = StepSyncProvider(spb, self._on_next_step)
@@ -1768,37 +1801,55 @@ class StepSeqHandler(BaseHandler):
     def cc_change(self, ccnum, ccval):
         delta = ccval if ccval < 64 else (ccval - 128)
 
+        if self._pressed_pads:
+            adjust_pad_func = {
+                KNOB_1: self._update_note_pad_length,
+                KNOB_2: self._update_note_pad_velocity,
+            }.get(ccnum)
+            adjust_step_func = {
+                KNOB_1: self._update_step_length,
+                KNOB_2: self._update_step_velocity,
+            }.get(ccnum)
+
+            step_pads = self._pads[:self._used_pads]
+            self._pressed_pads_action = "knobs"
+            for pad in self._pressed_pads:
+                if adjust_pad_func:
+                    note_spec = self._note_pads.get(pad)
+                    if note_spec is not None:
+                        adjust_pad_func(pad, *note_spec, delta)
+                        continue
+                if adjust_step_func:
+                    try:
+                        step = step_pads.index(pad)
+                        adjust_step_func(step, delta)
+                    except ValueError:
+                        pass
+            return True
+
         # Adjust tempo
         if ccnum == KNOB_1:
             self._show_screen_briefly(screen="tempo", cuia="TEMPO", timeout=1500)
             delta *= 0.1 if self._is_shifted else 1
             self._zynseq.set_tempo(self._zynseq.get_tempo() + delta)
 
+        # Update sequence's chain volume
         elif ccnum == KNOB_2:
-            # Update velocity of instrument or step
-            if self._pressed_pads:
-                self._pressed_pads_action = FN_VOLUME
-                step_pads = self._pads[:self._used_pads]
-
-                for pad in self._pressed_pads:
-                    note_spec = self._note_pads.get(pad)
-                    if note_spec is not None:
-                        self._update_note_pad_velocity(pad, *note_spec, delta)
-                        continue
-                    try:
-                        step = step_pads.index(pad)
-                        self._update_step_velocity(step, delta)
-                    except ValueError:
-                        pass
-
-            # Update sequence's chain volume
-            else:
-                # FIXME: update sequence volume here!
-                pass
+            self._show_screen_briefly(
+                screen="audio_mixer", cuia="SCREEN_AUDIO_MIXER", timeout=1500)
+            chain_id = self._get_chain_id_by_sequence(self._zynseq.bank, self._selected_seq)
+            chain = self._chain_manager.chains.get(chain_id)
+            if chain is not None:
+                mixer_chan = chain.mixer_chan
+                level = max(0, min(100, self._zynmixer.get_level(mixer_chan) * 100 + delta))
+                self._zynmixer.set_level(mixer_chan, level / 100)
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
             self._leds.led_off(self._pads[self._cursor], overlay=True)
+
+    def _update_step_length(self, step, delta):
+        print("Update step length", step)
 
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
@@ -1810,10 +1861,13 @@ class StepSeqHandler(BaseHandler):
         pad = self._pads[step]
         self._leds.led_on(pad, COLOR_RED, int((vel * 6) / 127))
 
+    def _update_note_pad_length(self, pad, note, vel, delta):
+        print("Update note pad length", pad)
+
     def _update_note_pad_velocity(self, pad, note, vel, delta):
-        is_selected = (note, vel) == self._selected_note
+        is_selected = [note, vel] == self._selected_note
         vel = min(127, max(10, vel + delta))
-        self._note_pads[pad] = (note, vel)
+        self._note_pads[pad] = [note, vel]
         color = self.NOTE_PAGE_COLORS[self._note_page_number]
         self._leds.led_on(pad, color, int((vel * 6) / 127))
         if is_selected:
@@ -1832,17 +1886,8 @@ class StepSeqHandler(BaseHandler):
             return
 
         for pad in self._pressed_pads:
-            self._note_pads[pad] = (note, vel)
+            self._note_pads[pad] = [note, vel]
         self.refresh()
-
-    def _show_screen_briefly(self, screen, cuia, timeout):
-        timer_name = "change-screen"
-        if screen != self._current_screen:
-            self._state_manager.send_cuia(cuia)
-            self._timer.add(timer_name, timeout,
-                lambda _: self._state_manager.send_cuia("BACK"))
-        else:
-            self._timer.update(timer_name, timeout)
 
     def _remove_note_pad(self, pad):
         idx = pad - BTN_PAD_START
@@ -1879,10 +1924,17 @@ class StepSeqHandler(BaseHandler):
         self._note_page_number = page_num
         self._selected_note = self._note_pads.get(index)
 
-    def _action_sync_chains(self, chain_src, chain_dst):
-        src = self._saved_state.get_chain_by_id(chain_src)
-        dst = self._saved_state.get_chain_by_id(chain_dst)
+    # This will be called as an action (look for 'sync-sequences' requests)
+    def _action_sync_sequences(self, src_bank, src_seq, dst_bank, dst_seq):
+        src_chain = self._get_chain_id_by_sequence(src_bank, src_seq)
+        dst_chain = self._get_chain_id_by_sequence(dst_bank, dst_seq)
+        src = self._saved_state.get_chain_by_id(src_chain)
+        dst = self._saved_state.get_chain_by_id(dst_chain)
         dst["pages"] = deepcopy(src["pages"])
+
+        # FIXME: add support for scenes
+        src_page = self._saved_state.get_page_by_sequence(src_seq)
+        self._saved_state.set_sequence_selection(dst_seq, *src_page)
 
     def _on_change_instrument(self, pad):
         index = pad - BTN_PAD_START
@@ -1905,9 +1957,13 @@ class StepSeqHandler(BaseHandler):
             velocity = vel
 
         if note is not None:
+            spb = self._libseq.getStepsPerBeat()
+            bpm = self._libseq.getTempo()
+            step_duration = int(60 / (spb * bpm) * 1000)
             chan = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
+
             velocity = velocity if on else 0
-            duration = 60000 if on else 0
+            duration = step_duration if on else 0
             self._libseq.playNote(note, velocity, chan, duration)
 
     def _toggle_step(self, step):
