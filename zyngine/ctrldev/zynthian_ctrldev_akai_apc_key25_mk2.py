@@ -548,15 +548,10 @@ class FeedbackLEDs:
         (self.led_on if state else self.led_off)(led)
 
     def led_off(self, led, overlay=False):
-        if overlay:
-            old_state = self._state.get(led)
-            if old_state:
-                self.led_on(led, *old_state)
-                return
-
         self._timer.remove(led)
         lib_zyncore.dev_send_note_on(self._idev, 0, led, 0)
-        self._state.pop(led, None)
+        if not overlay:
+            self._state[led] = (0, 0)
 
     def led_on(self, led, color=1, brightness=0, overlay=False):
         self._timer.remove(led)
@@ -567,6 +562,14 @@ class FeedbackLEDs:
     def led_blink(self, led):
         self._timer.remove(led)
         lib_zyncore.dev_send_note_on(self._idev, 0, led, 2)
+
+    def remove_overlay(self, led):
+        old_state = self._state.get(led)
+        if old_state:
+            self.led_on(led, *old_state)
+        else:
+            self._timer.remove(led)
+            lib_zyncore.dev_send_note_on(self._idev, 0, led, 0)
 
     def delayed(self, action, timeout, led, *args, **kwargs):
         action = getattr(self, action)
@@ -688,6 +691,22 @@ class BaseHandler:
         spb = self._libseq.getStepsPerBeat()
         bpm = self._libseq.getTempo()
         return int(60 / (spb * bpm) * 1000)
+
+    def _show_pattern_editor(self, seq):
+        # This way shows Zynpad everytime you change the sequuence (but is decoupled from UI)
+        # self._state_manager.send_cuia("SCREEN_ZYNPAD")
+        # self._select_pad(seq)
+        # self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
+
+        # FIXME: this way avoids to show Zynpad every time, BUT is coupled to UI!
+        if self._current_screen != 'pattern_editor':
+            self._state_manager.send_cuia("SCREEN_ZYNPAD")
+        self._select_pad(seq)
+        zynthian_gui_config.zyngui.screens["zynpad"].show_pattern_editor()
+
+    def _select_pad(self, pad):
+        # FIXME: this SHOULD be a CUIA, not this hack! (is coupled with UI)
+        zynthian_gui_config.zyngui.screens["zynpad"].select_pad(pad)
 
     def _show_screen_briefly(self, screen, cuia, timeout):
         # Only created when/if needed
@@ -1495,22 +1514,6 @@ class PadMatrixHandler(BaseHandler):
         self._request_action("stepseq", "sync-sequences",
             scene_src, seq_src, self._zynseq.bank, dst)
 
-    def _show_pattern_editor(self, seq):
-        # This way shows Zynpad everytime you change the sequuence (but is decoupled from UI)
-        # self._state_manager.send_cuia("SCREEN_ZYNPAD")
-        # self._select_pad(seq)
-        # self._state_manager.send_cuia("SCREEN_PATTERN_EDITOR")
-
-        # FIXME: this way avoids to show Zynpad every time, BUT is coupled to UI!
-        if self._current_screen != 'pattern_editor':
-            self._state_manager.send_cuia("SCREEN_ZYNPAD")
-        self._select_pad(seq)
-        zynthian_gui_config.zyngui.screens["zynpad"].show_pattern_editor()
-
-    def _select_pad(self, pad):
-        # FIXME: this SHOULD be a CUIA, not this hack! (is coupled with UI)
-        zynthian_gui_config.zyngui.screens["zynpad"].select_pad(pad)
-
 
 # --------------------------------------------------------------------------
 #  Jack client for playback sync
@@ -1725,7 +1728,7 @@ class StepSeqHandler(BaseHandler):
         self._clock.enable() if active else self._clock.disable()
         self._pressed_pads_action = "activation"
 
-    def refresh(self, shifted_override=None):
+    def refresh(self, shifted_override=None, only_steps=False):
         self._on_shifted_override(shifted_override)
         self._leds.all_off()
 
@@ -1733,7 +1736,8 @@ class StepSeqHandler(BaseHandler):
         if self._is_shifted:
             self._leds.led_on(BTN_KNOB_CTRL_SEND)
 
-        pads = {BTN_PAD_START+idx:None for idx in range(40)}
+        pad_count = 32 if only_steps else 40
+        pads = {BTN_PAD_START+idx:None for idx in range(pad_count)}
 
         # Dimm white for first step on each beat
         spb = self._libseq.getStepsPerBeat()
@@ -1746,13 +1750,14 @@ class StepSeqHandler(BaseHandler):
             pads[pad] = (color, mode)
 
         # Note pads that are not empty
-        color = self.NOTE_PAGE_COLORS[self._note_page_number]
-        for idx, note_spec in self._note_pads.items():
-            pad = BTN_PAD_START + idx
-            mode = int((note_spec[1] * 6) / 127)
-            if note_spec == self._selected_note:
-                mode = LED_PULSING_8
-            pads[pad] = (color, mode)
+        if not only_steps:
+            color = self.NOTE_PAGE_COLORS[self._note_page_number]
+            for idx, note_spec in self._note_pads.items():
+                pad = BTN_PAD_START + idx
+                mode = int((note_spec[1] * 6) / 127)
+                if note_spec == self._selected_note:
+                    mode = LED_PULSING_8
+                pads[pad] = (color, mode)
 
         for pad, args in pads.items():
             self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
@@ -1760,7 +1765,7 @@ class StepSeqHandler(BaseHandler):
     def set_sequence(self, seq):
         self._libseq.setSequence(seq)
         self._selected_seq = seq
-        patterns = self._get_sequence_patterns(seq, create=True)
+        patterns = self._get_sequence_patterns(self._zynseq.bank, seq, create=True)
         self._set_pattern(patterns[0])
 
         # Update active chain and instruments page
@@ -1780,7 +1785,11 @@ class StepSeqHandler(BaseHandler):
             if note == BTN_KNOB_CTRL_SEND:
                 self.refresh()
             elif BTN_PAD_START <= note <= BTN_PAD_START + 7:
-                self._on_change_instrument(note)
+                self._change_instrument(note)
+            elif note == BTN_LEFT:
+                self._change_to_previous_pattern()
+            elif note == BTN_RIGHT:
+                self._change_to_next_pattern()
             else:
                 return False
             return True
@@ -1873,7 +1882,8 @@ class StepSeqHandler(BaseHandler):
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
-            self._leds.led_off(self._pads[self._cursor], overlay=True)
+            # self._leds.led_off(self._pads[self._cursor], overlay=True)
+            self._leds.remove_overlay(self._pads[self._cursor])
 
     def _update_step_duration(self, step, delta):
         if self._selected_note is None:
@@ -1980,7 +1990,7 @@ class StepSeqHandler(BaseHandler):
         src_page = self._saved_state.get_page_by_sequence(src_seq)
         self._saved_state.set_sequence_selection(dst_seq, *src_page)
 
-    def _on_change_instrument(self, pad):
+    def _change_instrument(self, pad):
         index = pad - BTN_PAD_START
         note_spec = self._note_pads.get(index)
         if note_spec is None:
@@ -2037,7 +2047,8 @@ class StepSeqHandler(BaseHandler):
         if not self._is_active:
             return
         if self._cursor < self._used_pads:
-            self._leds.led_off(self._pads[self._cursor], overlay=True)
+            # self._leds.led_off(self._pads[self._cursor], overlay=True)
+            self._leds.remove_overlay(self._pads[self._cursor])
         self._cursor = self._get_pattern_playhead()
 
         # Avoid turning on the first LED when is stopping
@@ -2071,35 +2082,124 @@ class StepSeqHandler(BaseHandler):
         self._libseq.selectPattern(self._selected_pattern)
         self._update_for_selected_pattern()
 
-    def _get_sequence_patterns(self, seq, create=False):
-        seq_len = self._libseq.getSequenceLength(self._zynseq.bank, seq)
+    def _change_to_previous_pattern(self):
+        # FIXME: only first track is supported!
+        bank = self._zynseq.bank
+        seq = self._selected_seq
+        track = 0
+
+        # FIXME: if SELECT is pressed, unroll (copy current pattern to the previous one)
+        # FIXME: if pattern editor is open, change to new pattern
+
+        patterns = self._get_patterns_in_track(bank, seq, track, skip_duplicates=True)
+        if not patterns:
+            pattern = self._libseq.createPattern()
+            if not self._add_pattern_to_end_of_track(bank, seq, track, pattern):
+                print("error: could not add a new pattern!")
+                return
+            patterns.append(pattern)
+            pos = 1
+        else:
+            try:
+                pos = patterns.index(self._selected_pattern)
+            except ValueError:
+                pos = len(patterns) - 1
+
+        if pos > 0:
+            pos -= 1
+            self._set_pattern(patterns[pos])
+            self.refresh(only_steps=True)
+        self._show_patterns_bar(patterns, pos)
+
+    def _change_to_next_pattern(self):
+        # FIXME: only first track is supported!
+        bank = self._zynseq.bank
+        seq = self._selected_seq
+        track = 0
+
+        patterns = self._get_patterns_in_track(bank, seq, track, skip_duplicates=True)
+        try:
+            pos = patterns.index(self._selected_pattern)
+        except ValueError:
+            pos = 0
+
+        # FIXME: if SELECT is pressed, unroll (copy current pattern to the next one)
+        # FIXME: if pattern editor is open, change to new pattern
+
+        # If position is 7 or greater, do nothing (only 8 patterns supported)
+        if pos >= 7:
+            self._show_patterns_bar(patterns, pos)
+            return
+        elif pos == len(patterns) - 1:
+            pattern = self._libseq.createPattern()
+            if not self._add_pattern_to_end_of_track(bank, seq, track, pattern):
+                print("error: could not add a new pattern!")
+                return
+            patterns.append(pattern)
+
+        pos += 1
+        self._set_pattern(patterns[pos])
+        self.refresh(only_steps=True)
+        self._show_patterns_bar(patterns, pos)
+
+    def _show_patterns_bar(self, patterns, pos):
+        for i in range(8):
+            pad = BTN_PAD_START + i
+            color = COLOR_WHITE
+            mode = LED_BRIGHT_10
+            if i < len(patterns):
+                mode = LED_BRIGHT_100
+                if i == pos:
+                    color = COLOR_RED
+            self._leds.led_on(pad, color, mode, overlay=True)
+            self._leds.delayed("remove_overlay", 3000, pad)
+
+    def _add_pattern_to_end_of_track(self, bank, seq, track, pattern):
+        pos = 0
+        if self._libseq.getTracksInSequence(bank, seq) != 0:
+            pos = self._libseq.getSequenceLength(bank, seq)
+            while pos > 0:
+                # Arranger's offset step is a quarter note (24 clocks)
+                if self._libseq.getPatternAt(bank, seq, track, pos - 24) != -1:
+                    break
+                pos -= 24
+
+        return self._libseq.addPattern(bank, seq, track, pos, pattern)
+
+    def _get_sequence_patterns(self, bank, seq, create=False):
+        seq_len = self._libseq.getSequenceLength(bank, seq)
         pattern = -1
         retval = []
 
-        # If there are no patterns...
         if seq_len == 0:
             if create:
                 pattern = self._libseq.createPattern()
-                self._libseq.addPattern(self._zynseq.bank, seq, 0, 0, pattern)
+                self._libseq.addPattern(bank, seq, 0, 0, pattern)
                 retval.append(pattern)
             return retval
 
-        # Otherwise, search for first pattern in sequence
-        n_tracks = self._libseq.getTracksInSequence(self._zynseq.bank, seq)
+        n_tracks = self._libseq.getTracksInSequence(bank, seq)
         for track in range(n_tracks):
-            n_patts = self._libseq.getPatternsInTrack(self._zynseq.bank, seq, track)
-            if n_patts == 0:
-                continue
-            pos = 0
-            while pos < seq_len:
-                pattern = self._libseq.getPatternAt(self._zynseq.bank, seq, track, pos)
-                if pattern != -1:
-                    retval.append(pattern)
-                    pos += self._libseq.getPatternLength(pattern)
-                else:
-                    # Arranger's offset step is a quarter note (24 clocks)
-                    pos += 24
+            retval.extend(self._get_patterns_in_track(bank, seq, track))
+        return retval
 
+    def _get_patterns_in_track(self, bank, seq, track, skip_duplicates=False):
+        retval = []
+        n_patts = self._libseq.getPatternsInTrack(bank, seq, track)
+        if n_patts == 0:
+            return retval
+
+        seq_len = self._libseq.getSequenceLength(bank, seq)
+        pos = 0
+        while pos < seq_len:
+            pattern = self._libseq.getPatternAt(bank, seq, track, pos)
+            if pattern != -1:
+                if not skip_duplicates or pattern not in retval:
+                    retval.append(pattern)
+                pos += self._libseq.getPatternLength(pattern)
+            else:
+                # Arranger's offset step is a quarter note (24 clocks)
+                pos += 24
         return retval
 
     def _get_step_colors(self):
