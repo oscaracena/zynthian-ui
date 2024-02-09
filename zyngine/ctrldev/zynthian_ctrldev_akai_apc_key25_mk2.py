@@ -116,6 +116,7 @@ COLOR_BLUE                           = 0x25
 COLOR_BLUE_DARK                      = 0x2D
 COLOR_WHITE                          = 0x08
 COLOR_ORANGE                         = 0x09
+COLOR_AMBER                          = 0x54
 COLOR_PURPLE                         = 0x51
 COLOR_PINK                           = 0x39
 COLOR_YELLOW                         = 0x0D
@@ -576,6 +577,32 @@ class FeedbackLEDs:
 
 
 # --------------------------------------------------------------------------
+#  Helper class to handle knobs speed (mostly to reduce it)
+# --------------------------------------------------------------------------
+class KnobSpeedControl:
+    def __init__(self, steps_normal=3, steps_shifted=8):
+        self._steps_normal = steps_normal
+        self._steps_shifted = steps_shifted
+        self._knobs_ease = {}
+
+    def feed(self, ccnum, ccval, is_shifted=False):
+        delta = ccval if ccval < 64 else (ccval - 128)
+        count = self._knobs_ease.get(ccnum, 0)
+        steps = self._steps_shifted if is_shifted else self._steps_normal
+
+        if (delta < 0 and count > 0) or (delta > 0 and count < 0):
+            count = 0
+        count += delta
+
+        if abs(count) < steps:
+            self._knobs_ease[ccnum] = count
+            return
+
+        self._knobs_ease[ccnum] = 0
+        return delta
+
+
+# --------------------------------------------------------------------------
 #  Base class for handlers
 # --------------------------------------------------------------------------
 class BaseHandler:
@@ -656,6 +683,12 @@ class BaseHandler:
             None
         )
 
+    # FIXME: could this be in zynseq?
+    def _get_step_duration(self):
+        spb = self._libseq.getStepsPerBeat()
+        bpm = self._libseq.getTempo()
+        return int(60 / (spb * bpm) * 1000)
+
     def _show_screen_briefly(self, screen, cuia, timeout):
         # Only created when/if needed
         if self._timer is None:
@@ -696,7 +729,7 @@ class BaseHandler:
 class DeviceHandler(BaseHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._knobs_ease = {}
+        self._knobs_ease = KnobSpeedControl()
         self._is_alt_active = False
         self._is_playing = set()
         self._is_recording = set()
@@ -799,6 +832,10 @@ class DeviceHandler(BaseHandler):
         self._btn_timer.is_released(note)
 
     def cc_change(self, ccnum, ccval):
+        delta = self._knobs_ease.feed(ccnum, ccval, self._is_shifted)
+        if delta is None:
+            return
+
         zynpot = {
             KNOB_LAYER: 0,
             KNOB_BACK: 1,
@@ -808,19 +845,6 @@ class DeviceHandler(BaseHandler):
         if zynpot is None:
             return
 
-        # Knobs ease is used to control knob speed
-        count = self._knobs_ease.get(ccnum, 0)
-        delta = ccval if ccval < 64 else (ccval - 128)
-        steps = 2 if self._is_shifted else 8
-
-        if (delta < 0 and count > 0) or (delta > 0 and count < 0):
-            count = 0
-        count += delta
-        if abs(count) < steps:
-            self._knobs_ease[ccnum] = count
-            return
-
-        self._knobs_ease[ccnum] = 0
         self._state_manager.send_cuia("ZYNPOT", [zynpot, delta])
 
     def on_screen_change(self, screen):
@@ -1655,6 +1679,7 @@ class StepSeqHandler(BaseHandler):
         self._libseq = self._zynseq.libseq
         self._own_device_id = dev_idx
         self._cursor = 0
+        self._knobs_ease = KnobSpeedControl(steps_normal=12, steps_shifted=20)
         self._saved_state = StepSeqState()
 
         spb = self._libseq.getStepsPerBeat()
@@ -1678,6 +1703,7 @@ class StepSeqHandler(BaseHandler):
         self._note_pads_function = FN_PLAY_NOTE
         self._note_pages = None
         self._note_page_number = 0
+        self._notes_playing = {}
         self._pressed_pads = set()
         self._pressed_pads_action = None
 
@@ -1716,9 +1742,8 @@ class StepSeqHandler(BaseHandler):
             pads[pad] = (COLOR_WHITE, LED_BRIGHT_10)
 
         # Red + velocity for each non-empty step
-        for idx, vel in self._get_step_velocities():
-            pad = self._pads[idx]
-            pads[pad] = (COLOR_RED, int((vel * 6) / 127))
+        for pad, color, mode in self._get_step_colors():
+            pads[pad] = (color, mode)
 
         # Note pads that are not empty
         color = self.NOTE_PAGE_COLORS[self._note_page_number]
@@ -1799,15 +1824,17 @@ class StepSeqHandler(BaseHandler):
         return True
 
     def cc_change(self, ccnum, ccval):
-        delta = ccval if ccval < 64 else (ccval - 128)
+        delta = self._knobs_ease.feed(ccnum, ccval, self._is_shifted)
+        if delta is None:
+            return
 
         if self._pressed_pads:
             adjust_pad_func = {
-                KNOB_1: self._update_note_pad_length,
+                KNOB_1: self._update_note_pad_duration,
                 KNOB_2: self._update_note_pad_velocity,
             }.get(ccnum)
             adjust_step_func = {
-                KNOB_1: self._update_step_length,
+                KNOB_1: self._update_step_duration,
                 KNOB_2: self._update_step_velocity,
             }.get(ccnum)
 
@@ -1848,8 +1875,19 @@ class StepSeqHandler(BaseHandler):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
             self._leds.led_off(self._pads[self._cursor], overlay=True)
 
-    def _update_step_length(self, step, delta):
-        print("Update step length", step)
+    def _update_step_duration(self, step, delta):
+        if self._selected_note is None:
+            return
+
+        max_duration = self._libseq.getSteps()
+        note, velocity = self._selected_note[:2]
+        duration = self._libseq.getNoteDuration(step, note) + delta * 0.1
+        duration = round(min(max_duration, max(0.1, duration)), 1)
+
+        # FIXME: there is not setNoteDuration on Zynseq...
+        self._libseq.removeNote(step, note)
+        self._libseq.addNote(step, note, velocity, duration)
+        self.refresh()
 
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
@@ -1858,22 +1896,28 @@ class StepSeqHandler(BaseHandler):
         vel = self._libseq.getNoteVelocity(step, self._selected_note[0]) + delta
         vel = min(127, max(10, vel))
         self._libseq.setNoteVelocity(step, self._selected_note[0], vel)
-        pad = self._pads[step]
-        self._leds.led_on(pad, COLOR_RED, int((vel * 6) / 127))
+        self._leds.led_on(self._pads[step], COLOR_RED, int((vel * 6) / 127))
 
-    def _update_note_pad_length(self, pad, note, vel, delta):
-        print("Update note pad length", pad)
+    def _update_note_pad_duration(self, pad, note, velocity, duration, delta):
+        max_duration = self._libseq.getSteps()
+        duration = round(min(max_duration, max(0.1, duration + delta * 0.1)), 1)
+        self._note_pads[pad][:] = [note, velocity, duration]
+        self._play_instrument(pad, skip_if_running=True)
 
-    def _update_note_pad_velocity(self, pad, note, vel, delta):
-        is_selected = [note, vel] == self._selected_note
-        vel = min(127, max(10, vel + delta))
-        self._note_pads[pad] = [note, vel]
+    def _update_note_pad_velocity(self, pad, note, velocity, duration, delta):
+        is_selected = [note, velocity, duration] == self._selected_note
+        velocity = min(127, max(10, velocity + delta))
+        self._note_pads[pad][:] = [note, velocity, duration]
+        self._play_instrument(pad, skip_if_running=True)
+
         color = self.NOTE_PAGE_COLORS[self._note_page_number]
-        self._leds.led_on(pad, color, int((vel * 6) / 127))
+        self._leds.led_on(pad, color, int((velocity * 6) / 127))
+
         if is_selected:
-            self._selected_note[1] = vel
+            self._selected_note[1] = velocity
             self._leds.delayed("led_on", 1000, pad, color, LED_PULSING_8)
 
+    # NOTE: Do NOT change argument names here (is called using keyword args)
     def _on_midi_note_on(self, izmip, chan, note, vel):
         # Skip own device events / not assigning mode
         if izmip == self._own_device_id or len(self._pressed_pads) == 0:
@@ -1886,7 +1930,7 @@ class StepSeqHandler(BaseHandler):
             return
 
         for pad in self._pressed_pads:
-            self._note_pads[pad] = [note, vel]
+            self._note_pads[pad] = [note, vel, 1.0]
         self.refresh()
 
     def _remove_note_pad(self, pad):
@@ -1946,35 +1990,43 @@ class StepSeqHandler(BaseHandler):
             self._selected_seq, page=self._note_page_number, pad=index)
         self.refresh()
 
-    def _play_instrument(self, pad, velocity=None, on=True):
+    def _play_instrument(self, pad, velocity=None, on=True, skip_if_running=False):
         note_spec = self._note_pads.get(pad - BTN_PAD_START)
         if note_spec is None:
             return
-        note, vel = note_spec
+        note, note_velocity, note_duration = note_spec
+        if note is None:
+            return
 
         # Perform's velocity takes precedence over stored velocity
         if velocity is None:
-            velocity = vel
+            velocity = note_velocity
 
-        if note is not None:
-            spb = self._libseq.getStepsPerBeat()
-            bpm = self._libseq.getTempo()
-            step_duration = int(60 / (spb * bpm) * 1000)
-            chan = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
+        note_duration = int(self._get_step_duration() * note_duration)
+        chan = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
+        velocity = velocity if on else 0
+        duration = note_duration if on else 0
 
-            velocity = velocity if on else 0
-            duration = step_duration if on else 0
-            self._libseq.playNote(note, velocity, chan, duration)
+        if skip_if_running:
+            ts = self._notes_playing.get(note)
+            now = time.time()
+            if ts is not None:
+                if now - ts < duration / 1000:
+                    return
+            self._notes_playing[note] = now
+
+        self._libseq.playNote(note, velocity, chan, duration)
 
     def _toggle_step(self, step):
         if self._selected_note is None:
             return
 
-        note, vel = self._selected_note
+        note, velocity, duration = self._selected_note
         self._libseq.selectPattern(self._selected_pattern)
+
         if self._libseq.getNoteStart(step, note) == -1:
-            vel = vel if not self._is_shifted else vel // 2
-            self._libseq.addNote(step, note, vel, 1)
+            velocity = velocity if not self._is_shifted else velocity // 2
+            self._libseq.addNote(step, note, velocity, duration)
         else:
             self._libseq.removeNote(step, note)
             channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
@@ -2002,10 +2054,9 @@ class StepSeqHandler(BaseHandler):
 
     def _update_for_selected_pattern(self):
         spb = self._libseq.getStepsPerBeat()
-        bip = self._libseq.getBeatsInPattern()
         self._clock.set_steps_per_beat(spb)
 
-        steps = spb * bip
+        steps = self._libseq.getSteps()
         self._used_pads = min(32, steps)
         self._cursor = self._get_pattern_playhead()
 
@@ -2051,21 +2102,33 @@ class StepSeqHandler(BaseHandler):
 
         return retval
 
-    def _get_step_velocities(self):
+    def _get_step_colors(self):
         retval = []
         if self._selected_note is None:
             return retval
 
-        num_steps = self._libseq.getSteps()
+        num_steps = min(32, self._libseq.getSteps())
         note = self._selected_note[0]
-        step = 0
-        while step < num_steps:
-            duration = self._libseq.getNoteDuration(step, note)
-            if duration:
-                vel = self._libseq.getNoteVelocity(step, note)
-                for _ in range(ceil(duration)):
-                    retval.append((step, vel))
-                    step += 1
+
+        duration = None
+        for step in range(num_steps):
+            is_old_note = duration != None
+            if duration is None:
+                duration = self._libseq.getNoteDuration(step, note)
+            if not duration:
+                duration = None
                 continue
-            step += 1
+
+            mode = 1
+            if not is_old_note:
+                mode = (self._libseq.getNoteVelocity(step, note) * 6) // 127
+            pad = self._pads[step]
+            retval.append((pad, COLOR_AMBER if is_old_note else COLOR_RED, mode))
+
+            if duration <= 1:
+                duration = None
+                continue
+
+            duration -= 1
+
         return retval
