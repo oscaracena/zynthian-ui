@@ -1695,6 +1695,9 @@ class StepSeqHandler(BaseHandler):
         self._pattern_clock_offset = 0
         self._used_pads = 32
 
+        self._is_select_pressed = False
+        self._is_stage_play = False
+
         # We need to receive clock though MIDI
         self._libseq.enableMidiClockOutput(True)
 
@@ -1731,16 +1734,39 @@ class StepSeqHandler(BaseHandler):
         self._clock.enable() if active else self._clock.disable()
         self._pressed_pads_action = "activation"
 
-    def refresh(self, shifted_override=None, only_steps=False):
-        self._on_shifted_override(shifted_override)
-        self._leds.all_off()
+    def _refresh_status_leds(self):
+        self._leds.control_leds_off()
 
         # If SHIFT is pressed, show this mode as active
         if self._is_shifted:
             self._leds.led_on(BTN_KNOB_CTRL_SEND)
 
-        pad_count = 32 if only_steps else 40
-        pads = {BTN_PAD_START+idx:None for idx in range(pad_count)}
+    def _refresh_note_pads(self):
+        # On 'stage' playing, show patterns bar instead of note-pads
+        if self._is_stage_play:
+            self._show_patterns_bar(overlay=False)
+            return
+
+        # Otherwise, show note-pads that are not empty
+        color = self.NOTE_PAGE_COLORS[self._note_page_number]
+        pads = {self._pads[idx]:None for idx in range(32, 40)}
+        for idx, note_spec in self._note_pads.items():
+            pad = BTN_PAD_START + idx
+            mode = int((note_spec[1] * 6) / 127)
+            if note_spec == self._selected_note:
+                mode = LED_PULSING_8
+            pads[pad] = (color, mode)
+
+        for pad, args in pads.items():
+            self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
+
+    def refresh(self, shifted_override=None, only_steps=False):
+        # print(f"REFRESH: only_steps: {only_steps}, stage: {self._is_stage_play}")
+        self._on_shifted_override(shifted_override)
+        self._refresh_status_leds()
+        if not only_steps:
+            self._refresh_note_pads()
+        pads = {self._pads[idx]:None for idx in range(32)}
 
         # Dimm white for first step on each beat
         spb = self._libseq.getStepsPerBeat()
@@ -1751,16 +1777,6 @@ class StepSeqHandler(BaseHandler):
         # Red + velocity for each non-empty step
         for pad, color, mode in self._get_step_colors():
             pads[pad] = (color, mode)
-
-        # Note pads that are not empty
-        if not only_steps:
-            color = self.NOTE_PAGE_COLORS[self._note_page_number]
-            for idx, note_spec in self._note_pads.items():
-                pad = BTN_PAD_START + idx
-                mode = int((note_spec[1] * 6) / 127)
-                if note_spec == self._selected_note:
-                    mode = LED_PULSING_8
-                pads[pad] = (color, mode)
 
         for pad, args in pads.items():
             self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
@@ -1780,11 +1796,16 @@ class StepSeqHandler(BaseHandler):
 
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
-        self.refresh()
+        self._refresh_status_leds()
+        self._refresh_note_pads()
         return retval
 
     def note_on(self, note, velocity, shifted_override=None):
         self._on_shifted_override(shifted_override)
+        if self._is_stage_play:
+            self._is_stage_play = False
+            self.refresh()
+
         if self._is_shifted:
             # Just changed to this mode, perform a refresh
             if note == BTN_KNOB_CTRL_SEND:
@@ -1795,6 +1816,14 @@ class StepSeqHandler(BaseHandler):
                 self._change_to_previous_pattern()
             elif note == BTN_RIGHT:
                 self._change_to_next_pattern()
+            elif note == BTN_SOFT_KEY_SELECT:
+                self._is_select_pressed = True
+            elif note == BTN_PLAY:
+                self._libseq.togglePlayState(self._zynseq.bank, self._selected_seq)
+                state = self._libseq.getPlayState(self._zynseq.bank, self._selected_seq)
+                if state in (zynseq.SEQ_STARTING, zynseq.SEQ_PLAYING, zynseq.SEQ_RESTARTING):
+                    self._is_stage_play = True
+                    self.refresh()
             else:
                 return False
             return True
@@ -1833,6 +1862,8 @@ class StepSeqHandler(BaseHandler):
                 self._pressed_pads_action = None
         elif note == BTN_STOP_ALL_CLIPS:
             self._note_pads_function = FN_PLAY_NOTE
+        elif note == BTN_SOFT_KEY_SELECT:
+            self._is_select_pressed = False
         else:
             return False
         return True
@@ -1901,7 +1932,7 @@ class StepSeqHandler(BaseHandler):
         # FIXME: there is not setNoteDuration on Zynseq...
         self._libseq.removeNote(step, note)
         self._libseq.addNote(step, note, velocity, duration)
-        self.refresh()
+        self.refresh(only_steps=True)
 
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
@@ -2048,14 +2079,22 @@ class StepSeqHandler(BaseHandler):
             self._libseq.removeNote(step, note)
             channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
             self._libseq.playNote(note, 0, channel, 0)
-        self.refresh()
+        self.refresh(only_steps=True)
 
     def _on_next_step(self, ev):
         if not self._is_active:
             return
         if self._cursor < self._used_pads:
             self._leds.remove_overlay(self._pads[self._cursor])
+
         self._cursor = self._get_pattern_playhead()
+        if self._is_stage_play and self._cursor >= self._used_pads:
+            from_idx = self._selected_pattern_idx
+            to_idx = from_idx + 1
+            if to_idx >= len(self._sequence_patterns):
+                to_idx = 0
+            self._change_to_pattern_index(from_idx, to_idx)
+            self._show_patterns_bar()
 
         # Avoid turning on the first LED when is stopping
         state = self._libseq.getPlayState(self._zynseq.bank, self._selected_seq)
@@ -2093,18 +2132,30 @@ class StepSeqHandler(BaseHandler):
         self._libseq.selectPattern(self._selected_pattern)
         self._update_for_selected_pattern()
 
+    def _change_to_pattern_index(self, from_idx, to_idx, copy_pattern=False):
+        if copy_pattern:
+            self._libseq.copyPattern(
+                self._sequence_patterns[from_idx],
+                self._sequence_patterns[to_idx])
+            self._libseq.updateSequenceInfo()
+
+        self._selected_pattern_idx = to_idx
+        self._set_pattern(self._sequence_patterns[to_idx])
+        self._update_pattern_offset()
+        self.refresh(only_steps=True)
+
     def _change_to_previous_pattern(self):
         if self._selected_pattern_idx > 0:
-            self._selected_pattern_idx -= 1
-            self._set_pattern(self._sequence_patterns[self._selected_pattern_idx])
-            self._update_pattern_offset()
-            self.refresh(only_steps=True)
+            self._change_to_pattern_index(
+                self._selected_pattern_idx,
+                self._selected_pattern_idx - 1,
+                self._is_select_pressed)
         self._show_patterns_bar()
 
     def _change_to_next_pattern(self):
-        # FIXME: only first track is supported!
         bank = self._zynseq.bank
         seq = self._selected_seq
+        # FIXME: only first track is supported!
         track = 0
 
         if self._selected_pattern_idx < 7:
@@ -2115,11 +2166,10 @@ class StepSeqHandler(BaseHandler):
                     return
                 self._sequence_patterns.append(pattern)
 
-            self._selected_pattern_idx += 1
-            self._set_pattern(self._sequence_patterns[self._selected_pattern_idx])
-            self._update_pattern_offset()
-            self.refresh(only_steps=True)
-
+            self._change_to_pattern_index(
+                self._selected_pattern_idx,
+                self._selected_pattern_idx + 1,
+                self._is_select_pressed)
         self._show_patterns_bar()
 
     def _update_pattern_offset(self):
@@ -2127,7 +2177,7 @@ class StepSeqHandler(BaseHandler):
         for pattern in self._sequence_patterns[:self._selected_pattern_idx]:
             self._pattern_clock_offset += self._libseq.getPatternLength(pattern)
 
-    def _show_patterns_bar(self):
+    def _show_patterns_bar(self, overlay=True):
         for i in range(8):
             pad = BTN_PAD_START + i
             color = COLOR_WHITE
@@ -2136,8 +2186,7 @@ class StepSeqHandler(BaseHandler):
                 mode = LED_BRIGHT_100
                 if i == self._selected_pattern_idx:
                     color = COLOR_RED
-            self._leds.led_on(pad, color, mode, overlay=True)
-            self._leds.delayed("remove_overlay", 3000, pad)
+            self._leds.led_on(pad, color, mode, overlay=overlay)
 
     def _add_pattern_to_end_of_track(self, bank, seq, track, pattern):
         pos = 0
@@ -2168,7 +2217,7 @@ class StepSeqHandler(BaseHandler):
             retval.extend(self._get_patterns_in_track(bank, seq, track))
         return retval
 
-    def _get_patterns_in_track(self, bank, seq, track, skip_duplicates=False):
+    def _get_patterns_in_track(self, bank, seq, track):
         retval = []
         n_patts = self._libseq.getPatternsInTrack(bank, seq, track)
         if n_patts == 0:
@@ -2179,8 +2228,7 @@ class StepSeqHandler(BaseHandler):
         while pos < seq_len:
             pattern = self._libseq.getPatternAt(bank, seq, track, pos)
             if pattern != -1:
-                if not skip_duplicates or pattern not in retval:
-                    retval.append(pattern)
+                retval.append(pattern)
                 pos += self._libseq.getPatternLength(pattern)
             else:
                 # Arranger's offset step is a quarter note (24 clocks)
