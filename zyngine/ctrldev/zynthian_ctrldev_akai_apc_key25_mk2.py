@@ -32,7 +32,6 @@ import time
 import multiprocessing as mp
 import signal
 import jack
-from math import ceil
 from bisect import bisect
 from functools import partial
 from copy import deepcopy
@@ -881,6 +880,7 @@ class DeviceHandler(BaseHandler):
             "snapshot":       (BTN_ZS3_SHOT, 1),
             "zynpad":         (BTN_PAD_STEP, 0),
             "pattern_editor": (BTN_PAD_STEP, 1),
+            "arranger":       (BTN_PAD_STEP, 1),
             "tempo":          (BTN_METRONOME, 0),
         }
 
@@ -1687,9 +1687,12 @@ class StepSeqHandler(BaseHandler):
 
         spb = self._libseq.getStepsPerBeat()
         self._clock = StepSyncProvider(spb, self._on_next_step)
+        self._sequence_patterns = []
         self._selected_seq = None
         self._selected_pattern = None
+        self._selected_pattern_idx = 0
         self._selected_note = None
+        self._pattern_clock_offset = 0
         self._used_pads = 32
 
         # We need to receive clock though MIDI
@@ -1765,8 +1768,10 @@ class StepSeqHandler(BaseHandler):
     def set_sequence(self, seq):
         self._libseq.setSequence(seq)
         self._selected_seq = seq
-        patterns = self._get_sequence_patterns(self._zynseq.bank, seq, create=True)
-        self._set_pattern(patterns[0])
+        self._sequence_patterns = self._get_sequence_patterns(self._zynseq.bank, seq, create=True)
+        self._selected_pattern_idx = 0
+        self._pattern_clock_offset = 0
+        self._set_pattern(self._sequence_patterns[0])
 
         # Update active chain and instruments page
         chain_id = self._get_chain_id_by_sequence(self._zynseq.bank, seq)
@@ -1882,7 +1887,6 @@ class StepSeqHandler(BaseHandler):
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
-            # self._leds.led_off(self._pads[self._cursor], overlay=True)
             self._leds.remove_overlay(self._pads[self._cursor])
 
     def _update_step_duration(self, step, delta):
@@ -1945,7 +1949,10 @@ class StepSeqHandler(BaseHandler):
 
     def _remove_note_pad(self, pad):
         idx = pad - BTN_PAD_START
-        if self._note_pads.pop(idx, None):
+        note_spec = self._note_pads.pop(idx, None)
+        if note_spec is not None:
+            if note_spec == self._selected_note:
+                self._selected_note = None
             self.refresh()
 
     def _run_note_pad_action(self, note, velocity=None, state=True):
@@ -2047,7 +2054,6 @@ class StepSeqHandler(BaseHandler):
         if not self._is_active:
             return
         if self._cursor < self._used_pads:
-            # self._leds.led_off(self._pads[self._cursor], overlay=True)
             self._leds.remove_overlay(self._pads[self._cursor])
         self._cursor = self._get_pattern_playhead()
 
@@ -2075,6 +2081,11 @@ class StepSeqHandler(BaseHandler):
         # NOTE: libseq.getPatternPlayhead() does not work here!
         cps = self._libseq.getClocksPerStep()
         playpos = self._libseq.getPlayPosition(self._zynseq.bank, self._selected_seq)
+        playpos -= self._pattern_clock_offset
+
+        # If playhead is in previous patterns, return a big number (which will be ignored)
+        if playpos < 0:
+            return 256
         return playpos // cps
 
     def _set_pattern(self, pattern):
@@ -2083,33 +2094,12 @@ class StepSeqHandler(BaseHandler):
         self._update_for_selected_pattern()
 
     def _change_to_previous_pattern(self):
-        # FIXME: only first track is supported!
-        bank = self._zynseq.bank
-        seq = self._selected_seq
-        track = 0
-
-        # FIXME: if SELECT is pressed, unroll (copy current pattern to the previous one)
-        # FIXME: if pattern editor is open, change to new pattern
-
-        patterns = self._get_patterns_in_track(bank, seq, track, skip_duplicates=True)
-        if not patterns:
-            pattern = self._libseq.createPattern()
-            if not self._add_pattern_to_end_of_track(bank, seq, track, pattern):
-                print("error: could not add a new pattern!")
-                return
-            patterns.append(pattern)
-            pos = 1
-        else:
-            try:
-                pos = patterns.index(self._selected_pattern)
-            except ValueError:
-                pos = len(patterns) - 1
-
-        if pos > 0:
-            pos -= 1
-            self._set_pattern(patterns[pos])
+        if self._selected_pattern_idx > 0:
+            self._selected_pattern_idx -= 1
+            self._set_pattern(self._sequence_patterns[self._selected_pattern_idx])
+            self._update_pattern_offset()
             self.refresh(only_steps=True)
-        self._show_patterns_bar(patterns, pos)
+        self._show_patterns_bar()
 
     def _change_to_next_pattern(self):
         # FIXME: only first track is supported!
@@ -2117,39 +2107,34 @@ class StepSeqHandler(BaseHandler):
         seq = self._selected_seq
         track = 0
 
-        patterns = self._get_patterns_in_track(bank, seq, track, skip_duplicates=True)
-        try:
-            pos = patterns.index(self._selected_pattern)
-        except ValueError:
-            pos = 0
+        if self._selected_pattern_idx < 7:
+            if self._selected_pattern_idx >= len(self._sequence_patterns) - 1:
+                pattern = self._libseq.createPattern()
+                if not self._add_pattern_to_end_of_track(bank, seq, track, pattern):
+                    print("error: could not add a new pattern!")
+                    return
+                self._sequence_patterns.append(pattern)
 
-        # FIXME: if SELECT is pressed, unroll (copy current pattern to the next one)
-        # FIXME: if pattern editor is open, change to new pattern
+            self._selected_pattern_idx += 1
+            self._set_pattern(self._sequence_patterns[self._selected_pattern_idx])
+            self._update_pattern_offset()
+            self.refresh(only_steps=True)
 
-        # If position is 7 or greater, do nothing (only 8 patterns supported)
-        if pos >= 7:
-            self._show_patterns_bar(patterns, pos)
-            return
-        elif pos == len(patterns) - 1:
-            pattern = self._libseq.createPattern()
-            if not self._add_pattern_to_end_of_track(bank, seq, track, pattern):
-                print("error: could not add a new pattern!")
-                return
-            patterns.append(pattern)
+        self._show_patterns_bar()
 
-        pos += 1
-        self._set_pattern(patterns[pos])
-        self.refresh(only_steps=True)
-        self._show_patterns_bar(patterns, pos)
+    def _update_pattern_offset(self):
+        self._pattern_clock_offset = 0
+        for pattern in self._sequence_patterns[:self._selected_pattern_idx]:
+            self._pattern_clock_offset += self._libseq.getPatternLength(pattern)
 
-    def _show_patterns_bar(self, patterns, pos):
+    def _show_patterns_bar(self):
         for i in range(8):
             pad = BTN_PAD_START + i
             color = COLOR_WHITE
             mode = LED_BRIGHT_10
-            if i < len(patterns):
+            if i < len(self._sequence_patterns):
                 mode = LED_BRIGHT_100
-                if i == pos:
+                if i == self._selected_pattern_idx:
                     color = COLOR_RED
             self._leds.led_on(pad, color, mode, overlay=True)
             self._leds.delayed("remove_overlay", 3000, pad)
