@@ -672,6 +672,14 @@ class BaseHandler:
     def _request_action(self, receiver, action, *args, **kwargs):
         self._pending_actions.append((receiver, action, args, kwargs))
 
+    def _stop_all_sounds(self):
+        self._state_manager.send_cuia("ALL_SOUNDS_OFF")
+        self._state_manager.stop_midi_playback()
+        self._state_manager.stop_audio_player()
+        # FIXME: this is fishy...
+        self._state_manager.audio_player.engine.player.set_position(
+            self._state_manager.audio_player.handle, 0.0)
+
     def _on_shifted_override(self, override=None):
         if override is not None:
             self._is_shifted = override
@@ -986,14 +994,13 @@ class MixerHandler(BaseHandler):
                 return
 
             if self._track_buttons_function == FN_PATTERN_MANAGER:
-                # FIXME: update pattman function buttons too!
                 self._leds.led_blink(BTN_SOFT_KEY_CLIP_STOP)
                 return
 
             query = {
                 FN_MUTE: self._zynmixer.get_mute,
                 FN_SOLO: self._zynmixer.get_solo,
-                FN_SELECT: lambda c: c == (self._active_chain - 1),
+                FN_SELECT: self._is_active_chain,
             }[self._track_buttons_function]
             for i in range(8):
                 index = i + (8 if self._chains_bank == 1 else 0)
@@ -1077,6 +1084,12 @@ class MixerHandler(BaseHandler):
         self._active_chain = chain
         if refresh:
             self.refresh()
+
+    def _is_active_chain(self, position):
+        chain = self._chain_manager.get_chain_by_position(position)
+        if chain is None:
+            return False
+        return chain.chain_id == self._active_chain
 
     def _update_volume(self, ccnum, ccval):
         return self._update_control("level", ccnum, ccval, 0, 100)
@@ -1379,12 +1392,7 @@ class PadMatrixHandler(BaseHandler):
     def _handle_timed_button(self, btn, ptype):
         if btn == BTN_STOP_ALL_CLIPS:
             if ptype == PT_LONG:
-                self._state_manager.send_cuia("ALL_SOUNDS_OFF")
-                self._state_manager.stop_midi_playback()
-                self._state_manager.stop_audio_player()
-                # FIXME: this is fishy...
-                self._state_manager.audio_player.engine.player.set_position(
-                    self._state_manager.audio_player.handle, 0.0)
+                self._stop_all_sounds()
             else:
                 in_all_banks = ptype == PT_BOLD
                 self._stop_all_seqs(in_all_banks)
@@ -1396,7 +1404,7 @@ class PadMatrixHandler(BaseHandler):
         # FIXME: if pattern editor is open, and showing affected seq, update it!
         # FIXME: if Zynpad is open, also update it!
         # You can use self._current_screen...
-
+        self._libseq.updateSequenceInfo()
         seq_is_empty = self._libseq.isEmpty(self._zynseq.bank, seq)
         if self._pattman_func == FN_PATTERN_CLEAR:
             if not seq_is_empty:
@@ -1740,6 +1748,7 @@ class StepSeqHandler(BaseHandler):
         # If SHIFT is pressed, show this mode as active
         if self._is_shifted:
             self._leds.led_on(BTN_KNOB_CTRL_SEND)
+            self._leds.led_on(BTN_UP + self._note_page_number)
 
     def _refresh_note_pads(self):
         # On 'stage' playing, show patterns bar instead of note-pads
@@ -1761,7 +1770,6 @@ class StepSeqHandler(BaseHandler):
             self._leds.led_off(pad) if args is None else self._leds.led_on(pad, *args)
 
     def refresh(self, shifted_override=None, only_steps=False):
-        # print(f"REFRESH: only_steps: {only_steps}, stage: {self._is_stage_play}")
         self._on_shifted_override(shifted_override)
         self._refresh_status_leds()
         if not only_steps:
@@ -1816,6 +1824,8 @@ class StepSeqHandler(BaseHandler):
                 self._change_to_previous_pattern()
             elif note == BTN_RIGHT:
                 self._change_to_next_pattern()
+            elif note == BTN_STOP_ALL_CLIPS:
+                self._stop_all_sounds()
             elif note == BTN_SOFT_KEY_SELECT:
                 self._is_select_pressed = True
             elif note == BTN_PLAY:
@@ -1925,7 +1935,8 @@ class StepSeqHandler(BaseHandler):
             return
 
         max_duration = self._libseq.getSteps()
-        note, velocity = self._selected_note[:2]
+        note = self._selected_note[0]
+        velocity = self._libseq.getNoteVelocity(step, note)
         duration = self._libseq.getNoteDuration(step, note) + delta * 0.1
         duration = round(min(max_duration, max(0.1, duration)), 1)
 
