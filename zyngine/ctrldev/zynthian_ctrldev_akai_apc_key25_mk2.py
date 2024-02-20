@@ -36,7 +36,6 @@ from bisect import bisect
 from functools import partial
 from copy import deepcopy
 from threading import Thread, RLock, Event
-from queue import SimpleQueue
 from zyngine.ctrldev.zynthian_ctrldev_base import (
     zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
 )
@@ -1648,9 +1647,34 @@ class StepSyncConsumer(Thread):
 
 
 # --------------------------------------------------------------------------
-#  Class to marshall/un-marshall saved state of StepSeq
+#  Class to hold instrument pads for StepSeq (a.k.a. note-pads)
+#  Note: it inherits from dict to be json-serializable and easily comparable
 # --------------------------------------------------------------------------
-# FIXME: add support for scenes too!
+class NotePad(dict):
+    def __init__(self, note, velocity, duration=1, stutter_count=0, stutter_duration=1):
+        super().__init__(
+            note = note,
+            velocity = velocity,
+            duration = duration,
+            stutter_count = stutter_count,
+            stutter_duration = stutter_duration,
+        )
+
+    # To support dot-access
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except IndexError as err:
+            raise AttributeError(err.args[0]) from None
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+# --------------------------------------------------------------------------
+#  Class to marshall/un-marshall saved state of StepSeq
+#  FIXME: add support for scenes too!
+# --------------------------------------------------------------------------
 class StepSeqState:
     def __init__(self):
         self._seqs = {}
@@ -1659,13 +1683,13 @@ class StepSeqState:
     def load(self, state):
         state = deepcopy(state)
 
-        # Convert JSON stringfied key ints as real ints
+        # Convert JSON stringfied key ints as real ints, and note-pad's dicts to NotePad
         self._chains = state.get("chains", {})
         for c in self._chains.values():
             src_pages = c.get("pages", [])
             dst_pages = []
             for p in src_pages:
-                dst_pages.append({int(k):v for k,v in p.items()})
+                dst_pages.append({int(k):NotePad(**v) for k,v in p.items()})
             c["pages"] = dst_pages
 
         for seq, value in state.get("seqs", {}).items():
@@ -1690,6 +1714,70 @@ class StepSeqState:
 
 
 # --------------------------------------------------------------------------
+#  Note objects used in NotePlayer's event queue
+# --------------------------------------------------------------------------
+class Note:
+    def __init__(self, note, velocity, duration_cycles, channel, stutt_count, stutt_duration):
+        self._duration = duration_cycles
+        self._stutter_count = stutt_count
+        self._stutter_duration = stutt_duration
+        self._velocity = velocity
+        self._elapsed = 0
+        self._is_stopped = False
+        self._is_finished = False
+        self._iter = iter(self)
+
+        # Public attributes
+        self.note = note
+        self.channel = channel
+
+    def stop(self):
+        self._is_stopped = True
+
+    def __next__(self):
+        if self._is_stopped:
+            if not self._is_finished:
+                self._is_finished = True
+                return ("off", self.note, self.channel, 0)
+            raise StopIteration()
+        return next(self._iter)
+
+    def __iter__(self):
+        if self._stutter_count > 0 and self._duration > 0:
+            while self._stutter_count:
+                total_stutt_duration = self._stutter_count * self._stutter_duration * 2
+                if total_stutt_duration < self._duration:
+                    break
+                self._stutter_count -= 1
+
+        for _ in range(self._stutter_count):
+            yield self._event("on", self.note, self.channel, self._velocity)
+            duration = self._stutter_duration - 1
+            while duration > 0:
+                duration -= 1
+                yield self._event()
+            yield self._event("off", self.note, self.channel, 0)
+            duration = self._stutter_duration - 1
+            while duration > 0:
+                duration -= 1
+                yield self._event()
+
+        if self._duration > 0 and self._elapsed > self._duration:
+            return
+
+        mode = "on" if self._velocity != 0 else "off"
+        yield self._event(mode, self.note, self.channel, self._velocity)
+        if mode == "on" and self._duration > 0:
+            while self._elapsed < self._duration:
+                yield self._event()
+            yield self._event("off", self.note, self.channel, 0)
+
+    def _event(self, *args):
+        self._elapsed += 1
+        return args
+
+
+# --------------------------------------------------------------------------
 #  Note player (adds support for stutter)
 # --------------------------------------------------------------------------
 class NotePlayer(Thread):
@@ -1699,46 +1787,37 @@ class NotePlayer(Thread):
         self._ready = Event()
         self._notes_pending = []
         self._pending_lock = RLock()
+
         self.daemon = True
         self.start()
 
     def run(self):
         while self._ready.wait():
-            self._tick()
+            try:
+                self._tick()
+            except Exception as ex:
+                print(f"ERROR: on note player: {ex}")
             time.sleep(self._clock_cycles_to_ms(1) / 1000)
 
     def stop(self, note, channel):
-        self._libseq.playNote(note, 0, channel, 0)
+        with self._pending_lock:
+            for n in self._notes_pending:
+                if n.note == note and n.channel == channel:
+                    n.stop()
+                    return
+            n = Note(note, 0, 0, channel, 0, 1)
+            self._notes_pending.append(n)
+            self._ready.set()
 
     def play(self, note, velocity, duration_ms, channel=0, stutt_count=0, stutt_duration=1):
-        print("ms/cycle:", self._clock_cycles_to_ms(stutt_duration))
-        if stutt_count == 0:
-            with self._pending_lock:
-                try:
-                    notes = self._notes_pending[0]
-                except IndexError:
-                    notes = []
-                    self._notes_pending.append(notes)
-                    self._ready.set()
-                notes.append((note, velocity, channel, duration_ms))
-            return
-
-        duration_orig = duration_ms
-        duration_ms = self._clock_cycles_to_ms(stutt_duration)
-        ticks = (stutt_count + 1) * stutt_duration
-
+        duration_cycles = duration_ms / self._clock_cycles_to_ms(1)
         with self._pending_lock:
-            for i in range(ticks):
-                if i == ticks - 1:
-                    duration_ms = duration_orig
-                try:
-                    notes = self._notes_pending[i]
-                except IndexError:
-                    notes = []
-                    self._notes_pending.append(notes)
-                    self._ready.set()
-                if i % stutt_duration == 0:
-                    notes.append((note, velocity, channel, duration_ms))
+            for n in self._notes_pending:
+                if n.note == note and n.channel == channel:
+                    n.stop()
+            n = Note(note, velocity, duration_cycles, channel, stutt_count, stutt_duration)
+            self._notes_pending.append(n)
+            self._ready.set()
 
     def _clock_cycles_to_ms(self, cycles):
         # 24 'Clock' events for each beat (quarter note)
@@ -1746,17 +1825,24 @@ class NotePlayer(Thread):
         return round(60 / bpm / 24 * 1000 * cycles)
 
     def _tick(self):
-        print("CLOCK")
-
-        # NOTE: this should be as light as possible!
         with self._pending_lock:
             if not self._notes_pending:
                 self._ready.clear()
                 return
-            notes = self._notes_pending.pop(0)
-        for note_spec in notes:
-            print("EN-QUEUE NOTE")
-            self._libseq.playNote(*note_spec)
+            for note in self._notes_pending[:]:
+                try:
+                    note_spec = next(note)
+                    if note_spec:
+                        self._send_note(*note_spec)
+                except StopIteration:
+                    self._notes_pending.remove(note)
+
+    def _send_note(self, mode, note, channel, velocity=0):
+        status = 0x90 if mode == "on" else 0x80
+        status |= (channel & 0xF)
+        b1 = note & 0x7F
+        b2 = (velocity & 0x7F) if mode == "on" else 0
+        self._libseq.sendMidiCommand(status, b1, b2)
 
 
 # --------------------------------------------------------------------------
@@ -1826,7 +1912,6 @@ class StepSeqHandler(BaseHandler):
         else:
             self._update_for_selected_pattern()
         self._clock.enable() if active else self._clock.disable()
-        # self._note_player.enable() if active else self._note_player.disable()
         self._pressed_pads_action = "activation"
 
     def _refresh_status_leds(self):
@@ -1848,7 +1933,7 @@ class StepSeqHandler(BaseHandler):
         pads = {self._pads[idx]:None for idx in range(32, 40)}
         for idx, note_spec in self._note_pads.items():
             pad = BTN_PAD_START + idx
-            mode = int((note_spec[1] * 6) / 127)
+            mode = int((note_spec.velocity * 6) / 127)
             if note_spec == self._selected_note:
                 mode = LED_PULSING_8
             pads[pad] = (color, mode)
@@ -1949,10 +2034,9 @@ class StepSeqHandler(BaseHandler):
             if BTN_PAD_START <= note <= BTN_PAD_START + 7:
                 if not self._is_shifted:
                     self._run_note_pad_action(note, state=False)
-            elif note in self._pads[:self._used_pads] \
-                    and self._pressed_pads_action is None:
-                self._toggle_step(self._pads.index(note))
-
+            elif note in self._pads[:self._used_pads]:
+                if self._pressed_pads_action is None:
+                    self._toggle_step(self._pads.index(note))
             if note in self._pressed_pads:
                 self._pressed_pads.discard(note)
             if not self._pressed_pads:
@@ -1990,7 +2074,7 @@ class StepSeqHandler(BaseHandler):
                 if adjust_pad_func:
                     note_spec = self._note_pads.get(pad)
                     if note_spec is not None:
-                        adjust_pad_func(pad, *note_spec, delta)
+                        adjust_pad_func(pad, note_spec, delta)
                         continue
                 if adjust_step_func:
                     try:
@@ -2026,7 +2110,7 @@ class StepSeqHandler(BaseHandler):
         if self._selected_note is None:
             return
 
-        note = self._selected_note[0]
+        note = self._selected_note.note
         max_duration = self._libseq.getSteps()
         duration = self._libseq.getNoteDuration(step, note) + delta * 0.1
         duration = round(min(max_duration, max(0.1, duration)), 1)
@@ -2037,8 +2121,8 @@ class StepSeqHandler(BaseHandler):
     def _update_step_velocity(self, step, delta):
         if self._selected_note is None:
             return
-        note = self._selected_note[0]
 
+        note = self._selected_note.note
         velocity = self._libseq.getNoteVelocity(step, note) + delta
         velocity = min(127, max(10, velocity))
         self._libseq.setNoteVelocity(step, note, velocity)
@@ -2048,7 +2132,8 @@ class StepSeqHandler(BaseHandler):
     def _update_step_stutter_count(self, step, delta):
         if self._selected_note is None:
             return
-        note = self._selected_note[0]
+
+        note = self._selected_note.note
         count = self._libseq.getStutterCount(step, note) + delta
         count = min(MAX_STUTTER_COUNT, max(0, count))
         self._libseq.setStutterCount(step, note, count)
@@ -2057,37 +2142,39 @@ class StepSeqHandler(BaseHandler):
     def _update_step_stutter_duration(self, step, delta):
         if self._selected_note is None:
             return
-        note = self._selected_note[0]
 
+        note = self._selected_note.note
         duration = self._libseq.getStutterDur(step, note) + delta
         duration = min(MAX_STUTTER_DURATION, max(1, duration))
         self._libseq.setStutterDur(step, note, duration)
         self._play_step(step)
 
-    def _update_note_pad_duration(self, pad, note, velocity, duration, delta):
+    def _update_note_pad_duration(self, pad, note_spec, delta):
         max_duration = self._libseq.getSteps()
-        duration = round(min(max_duration, max(0.1, duration + delta * 0.1)), 1)
-        self._note_pads[pad][:] = [note, velocity, duration]
+        note_spec.duration = \
+            round(min(max_duration, max(0.1, note_spec.duration + delta * 0.1)), 1)
         self._play_note_pad(pad)
 
-    def _update_note_pad_velocity(self, pad, note, velocity, duration, delta):
-        is_selected = [note, velocity, duration] == self._selected_note
-        velocity = min(127, max(10, velocity + delta))
-        self._note_pads[pad][:] = [note, velocity, duration]
+    def _update_note_pad_velocity(self, pad, note_spec, delta):
+        is_selected = note_spec == self._selected_note
+        note_spec.velocity = min(127, max(10, note_spec.velocity + delta))
         self._play_note_pad(pad)
 
         color = self.NOTE_PAGE_COLORS[self._note_page_number]
-        self._leds.led_on(pad, color, int((velocity * 6) / 127))
+        self._leds.led_on(pad, color, int((note_spec.velocity * 6) / 127))
 
         if is_selected:
-            self._selected_note[1] = velocity
             self._leds.delayed("led_on", 1000, pad, color, LED_PULSING_8)
 
-    def _update_note_pad_stutter_count(self, pad, note, velocity, duration, delta):
-        print(f"update note pad stutter count, {pad}, {delta}")
+    def _update_note_pad_stutter_count(self, pad, note_spec, delta):
+        note_spec.stutter_count = \
+            min(MAX_STUTTER_COUNT, max(0, note_spec.stutter_count + delta))
+        self._play_note_pad(pad)
 
-    def _update_note_pad_stutter_duration(self, pad, note, velocity, duration, delta):
-        print(f"update note pad stutter duration, {pad}, {delta}")
+    def _update_note_pad_stutter_duration(self, pad, note_spec, delta):
+        note_spec.stutter_duration = \
+            min(MAX_STUTTER_DURATION, max(0, note_spec.stutter_duration + delta))
+        self._play_note_pad(pad)
 
     # NOTE: Do NOT change argument names here (is called using keyword args)
     def _on_midi_note_on(self, izmip, chan, note, vel):
@@ -2102,7 +2189,7 @@ class StepSeqHandler(BaseHandler):
             return
 
         for pad in self._pressed_pads:
-            self._note_pads[pad] = [note, vel, 1.0]
+            self._note_pads[pad] = NotePad(note, vel, 1.0)
         self.refresh()
 
     def _remove_note_pad(self, pad):
@@ -2174,21 +2261,18 @@ class StepSeqHandler(BaseHandler):
         note_spec = self._note_pads.get(pad - BTN_PAD_START)
         if note_spec is None:
             return
-        note, note_velocity, note_duration = note_spec
-        if note is None:
-            return
-
         # Perform's velocity takes precedence over stored velocity
         if velocity is None:
-            velocity = note_velocity
+            velocity = note_spec.velocity
 
         channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
         if on:
-            duration_ms = int(self._get_step_duration() * note_duration)
+            # duration_ms = int(self._get_step_duration() * note_spec.duration)
             self._note_player.play(
-                note, velocity, duration_ms, channel, stutt_count=1, stutt_duration=1)
+                note_spec.note, velocity, 0, channel,
+                note_spec.stutter_count, note_spec.stutter_duration)
         else:
-            self._note_player.stop(note, channel)
+            self._note_player.stop(note_spec.note, channel)
 
     def _play_step(self, step, only_when_stopped=True):
         if only_when_stopped:
@@ -2196,27 +2280,31 @@ class StepSeqHandler(BaseHandler):
             if state != zynseq.SEQ_STOPPED:
                 return
 
-        note = self._selected_note[0]
+        note = self._selected_note.note
         velocity = self._libseq.getNoteVelocity(step, note)
         duration_ms = int(self._get_step_duration() * self._libseq.getNoteDuration(step, note))
         channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
+        stutt_count = self._libseq.getStutterCount(step, note)
+        stutt_duration = self._libseq.getStutterDur(step, note)
         self._note_player.play(
-            note, velocity, duration_ms, channel, stutt_count=1, stutt_duration=1)
+            note, velocity, duration_ms, channel, stutt_count, stutt_duration)
 
     def _toggle_step(self, step):
         if self._selected_note is None:
             return
 
-        note, velocity, duration = self._selected_note
-        self._libseq.selectPattern(self._selected_pattern)
-
-        if self._libseq.getNoteStart(step, note) == -1:
+        spec = self._selected_note
+        if self._libseq.getNoteStart(step, spec.note) == -1:
+            velocity = spec.velocity
             velocity = velocity if not self._is_shifted else velocity // 2
-            self._libseq.addNote(step, note, velocity, duration)
+            self._libseq.addNote(
+                step, spec.note, velocity, spec.duration)
+            self._libseq.setStutterCount(step, spec.note, spec.stutter_count)
+            self._libseq.setStutterDur(step, spec.note, spec.stutter_duration)
         else:
-            self._libseq.removeNote(step, note)
+            self._libseq.removeNote(step, spec.note)
             channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
-            self._libseq.playNote(note, 0, channel, 0)
+            self._libseq.playNote(spec.note, 0, channel, 0)
         self.refresh(only_steps=True)
 
     def _on_next_step(self, ev):
@@ -2293,7 +2381,7 @@ class StepSeqHandler(BaseHandler):
     def _change_to_next_pattern(self):
         bank = self._zynseq.bank
         seq = self._selected_seq
-        # FIXME: only first track is supported!
+        # FIXME: add support for track selection
         track = 0
 
         if self._selected_pattern_idx < 7:
@@ -2379,7 +2467,7 @@ class StepSeqHandler(BaseHandler):
             return retval
 
         num_steps = min(32, self._libseq.getSteps())
-        note = self._selected_note[0]
+        note = self._selected_note.note
 
         duration = None
         for step in range(num_steps):
