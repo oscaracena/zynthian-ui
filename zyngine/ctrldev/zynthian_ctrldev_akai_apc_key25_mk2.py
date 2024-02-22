@@ -699,9 +699,10 @@ class BaseHandler:
         self._state_manager.send_cuia("ALL_SOUNDS_OFF")
         self._state_manager.stop_midi_playback()
         self._state_manager.stop_audio_player()
-        # FIXME: Tthis is fishy...
-        self._state_manager.audio_player.engine.player.set_position(
-            self._state_manager.audio_player.handle, 0.0)
+
+        # FIXME: oram -> AttributeError: 'zynthian_engine_audioplayer' object has no attribute 'player'
+        # self._state_manager.audio_player.engine.player.set_position(
+        #     self._state_manager.audio_player.handle, 0.0)
 
     def _on_shifted_override(self, override=None):
         if override is not None:
@@ -2012,7 +2013,8 @@ class StepSeqHandler(BaseHandler):
             if note == BTN_KNOB_CTRL_SEND:
                 self.refresh()
             elif BTN_PAD_START <= note <= BTN_PAD_START + 7:
-                self._change_instrument(note)
+                if not self._is_arranger_mode:
+                    self._change_instrument(note)
             elif note == BTN_LEFT:
                 self._change_to_previous_pattern()
             elif note == BTN_RIGHT:
@@ -2076,7 +2078,7 @@ class StepSeqHandler(BaseHandler):
                 self._pressed_pads_action = None
         elif note == BTN_STOP_ALL_CLIPS:
             if self._is_arranger_mode:
-                self._note_pads_function = FN_REMOVE_PATTERN
+                self._note_pads_function = FN_SELECT_PATTERN
             else:
                 self._note_pads_function = FN_PLAY_NOTE
         elif note == BTN_SOFT_KEY_SELECT:
@@ -2237,18 +2239,24 @@ class StepSeqHandler(BaseHandler):
             self.refresh()
 
     def _run_note_pad_action(self, note, velocity=None, state=True):
-        if self._note_pads_function == FN_REMOVE_PATTERN:
-            pass
-        elif self._note_pads_function == FN_SELECT_PATTERN:
-            dst_idx = note - BTN_PAD_START
-            if dst_idx < len(self._sequence_patterns):
-                self._change_to_pattern_index(self._selected_pattern_idx, dst_idx)
-                self._refresh_note_pads()
-        elif self._note_pads_function == FN_PLAY_NOTE:
+        # Only in note-on event
+        if state:
+            if self._note_pads_function == FN_REMOVE_PATTERN:
+                dst_idx = note - BTN_PAD_START
+                if dst_idx < len(self._sequence_patterns):
+                    self._remove_pattern(dst_idx)
+                    self._refresh_note_pads()
+            elif self._note_pads_function == FN_SELECT_PATTERN:
+                dst_idx = note - BTN_PAD_START
+                if dst_idx < len(self._sequence_patterns):
+                    self._change_to_pattern_index(self._selected_pattern_idx, dst_idx)
+                    self._refresh_note_pads()
+            elif self._note_pads_function == FN_REMOVE_NOTE:
+                self._remove_note_pad(note)
+
+        if self._note_pads_function == FN_PLAY_NOTE:
             self._play_note_pad(note, velocity, on=state, force=True)
             self._enable_midi_listening(state)
-        elif self._note_pads_function == FN_REMOVE_NOTE:
-            self._remove_note_pad(note)
 
     def _change_instruments_page(self, offset):
         new_page_number = max(0, min(3, self._note_page_number + offset))
@@ -2382,6 +2390,7 @@ class StepSeqHandler(BaseHandler):
             return
         self._is_arranger_mode = status
         if status:
+            self._note_pads_function = FN_SELECT_PATTERN
             self._previous_screen = self._current_screen
             self._state_manager.send_cuia("SCREEN_ARRANGER")
             self._update_ui_arranger(
@@ -2428,7 +2437,7 @@ class StepSeqHandler(BaseHandler):
 
         self._selected_pattern_idx = to_idx
         self._set_pattern(self._sequence_patterns[to_idx])
-        self._update_pattern_offset()
+        self._pattern_clock_offset = self._get_pattern_position(to_idx)
         self._update_ui_arranger(
             cell_selected=(self._pattern_clock_offset // 24, self._selected_seq))
         self.refresh(only_steps=True)
@@ -2464,10 +2473,39 @@ class StepSeqHandler(BaseHandler):
                 self._is_select_pressed)
         self._show_patterns_bar()
 
-    def _update_pattern_offset(self):
-        self._pattern_clock_offset = 0
-        for pattern in self._sequence_patterns[:self._selected_pattern_idx]:
-            self._pattern_clock_offset += self._libseq.getPatternLength(pattern)
+    def _remove_pattern(self, index):
+        bank = self._zynseq.bank
+        seq = self._selected_seq
+        # FIXME: add support for track selection
+        track = 0
+
+        # Last pattern could not be removed
+        if len(self._sequence_patterns) == 1:
+            return
+
+        # Move right patterns one place to the left
+        position = None
+        for offset, pattern in enumerate(self._sequence_patterns[index:]):
+            prev_position = position
+            position = self._get_pattern_position(index + offset)
+            self._libseq.removePattern(bank, seq, track, position)
+            if offset > 0:
+                self._libseq.addPattern(bank, seq, track, prev_position, pattern)
+
+        # If pattern to remove is to the left of selected, then update selected
+        if index <= self._selected_pattern_idx:
+            self._selected_pattern_idx = max(0, self._selected_pattern_idx - 1)
+
+        self._sequence_patterns = self._get_sequence_patterns(self._zynseq.bank, seq, create=True)
+        self._change_to_pattern_index(0, self._selected_pattern_idx)
+        new_position = self._get_pattern_position(self._selected_pattern_idx)
+        self._update_ui_arranger(cell_selected=(new_position // 24, self._selected_seq))
+
+    def _get_pattern_position(self, index):
+        position = 0
+        for pattern in self._sequence_patterns[:index]:
+            position += self._libseq.getPatternLength(pattern)
+        return position
 
     def _show_patterns_bar(self, overlay=True):
         for i in range(8):
