@@ -163,6 +163,7 @@ FN_PLAY_NOTE                         = 0x0C
 FN_REMOVE_NOTE                       = 0x0D
 FN_REMOVE_PATTERN                    = 0x0F
 FN_SELECT_PATTERN                    = 0x10
+FN_CLEAR_PATTERN                     = 0x11
 
 PT_SHORT                             = "short"
 PT_BOLD                              = "bold"
@@ -1604,6 +1605,9 @@ class StepSyncProvider(mp.Process):
 
     # Internal commands
     def _cmd_enable(self, enable):
+        if self._jack_client is None:
+            return
+
         if enable:
             self._tick_counter = 0
             self._jack_client.activate()
@@ -2046,6 +2050,8 @@ class StepSeqHandler(BaseHandler):
                     self._note_pads_function = FN_REMOVE_PATTERN
                 else:
                     self._note_pads_function = FN_REMOVE_NOTE
+            elif note == BTN_SOFT_KEY_MUTE:
+                self._note_pads_function = FN_CLEAR_PATTERN
             elif note == BTN_SOFT_KEY_SELECT:
                 self._enable_arranger_mode(False)
             elif note == BTN_LEFT:
@@ -2076,7 +2082,7 @@ class StepSeqHandler(BaseHandler):
                 self._pressed_pads.discard(note)
             if not self._pressed_pads:
                 self._pressed_pads_action = None
-        elif note == BTN_STOP_ALL_CLIPS:
+        elif note in (BTN_STOP_ALL_CLIPS, BTN_SOFT_KEY_MUTE):
             if self._is_arranger_mode:
                 self._note_pads_function = FN_SELECT_PATTERN
             else:
@@ -2239,18 +2245,27 @@ class StepSeqHandler(BaseHandler):
             self.refresh()
 
     def _run_note_pad_action(self, note, velocity=None, state=True):
+        dst_idx = note - BTN_PAD_START
+
         # Only in note-on event
         if state:
-            if self._note_pads_function == FN_REMOVE_PATTERN:
-                dst_idx = note - BTN_PAD_START
-                if dst_idx < len(self._sequence_patterns):
-                    self._remove_pattern(dst_idx)
-                    self._refresh_note_pads()
+            if len(self._pressed_pads) == 2:
+                src_idx = (self._pressed_pads - {dst_idx}).pop()
+                self._copy_pattern(src_idx, dst_idx)
+                self._leds.led_on(note, COLOR_LIME, LED_BLINKING_16, overlay=True)
+                self._leds.delayed("remove_overlay", 1000, note)
             elif self._note_pads_function == FN_SELECT_PATTERN:
-                dst_idx = note - BTN_PAD_START
                 if dst_idx < len(self._sequence_patterns):
                     self._change_to_pattern_index(self._selected_pattern_idx, dst_idx)
                     self._refresh_note_pads()
+            elif self._note_pads_function == FN_REMOVE_PATTERN:
+                if dst_idx < len(self._sequence_patterns):
+                    self._remove_pattern(dst_idx)
+                    self._refresh_note_pads()
+            elif self._note_pads_function == FN_CLEAR_PATTERN:
+                self._clear_pattern(dst_idx)
+                self._leds.led_on(note, COLOR_RED, LED_BLINKING_16, overlay=True)
+                self._leds.delayed("remove_overlay", 1000, note)
             elif self._note_pads_function == FN_REMOVE_NOTE:
                 self._remove_note_pad(note)
 
@@ -2430,10 +2445,7 @@ class StepSeqHandler(BaseHandler):
 
     def _change_to_pattern_index(self, from_idx, to_idx, copy_pattern=False):
         if copy_pattern:
-            self._libseq.copyPattern(
-                self._sequence_patterns[from_idx],
-                self._sequence_patterns[to_idx])
-            self._libseq.updateSequenceInfo()
+            self._copy_pattern(from_idx, to_idx)
 
         self._selected_pattern_idx = to_idx
         self._set_pattern(self._sequence_patterns[to_idx])
@@ -2453,7 +2465,7 @@ class StepSeqHandler(BaseHandler):
     def _change_to_next_pattern(self):
         bank = self._zynseq.bank
         seq = self._selected_seq
-        # FIXME: add support for track selection
+        # FIXME: Add support for track selection
         track = 0
 
         if self._selected_pattern_idx < 7:
@@ -2473,10 +2485,28 @@ class StepSeqHandler(BaseHandler):
                 self._is_select_pressed)
         self._show_patterns_bar()
 
+    def _copy_pattern(self, from_idx, to_idx):
+        self._libseq.copyPattern(
+            self._sequence_patterns[from_idx],
+            self._sequence_patterns[to_idx])
+        self._libseq.updateSequenceInfo()
+
+    def _clear_pattern(self, index):
+        current = self._libseq.getPatternIndex()
+        pattern = self._sequence_patterns[index]
+        self._libseq.selectPattern(pattern)
+        self._libseq.clear()
+        self._libseq.updateSequenceInfo()
+        if current != -1 and current != pattern:
+            self._libseq.selectPattern(current)
+
+        if index == self._selected_pattern_idx:
+            self.refresh(only_steps=True)
+
     def _remove_pattern(self, index):
         bank = self._zynseq.bank
         seq = self._selected_seq
-        # FIXME: add support for track selection
+        # FIXME: Add support for track selection
         track = 0
 
         # Last pattern could not be removed
