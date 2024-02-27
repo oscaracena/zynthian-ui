@@ -116,14 +116,19 @@ KNOB_8                               = 0x37
 COLOR_RED                            = 0x05
 COLOR_GREEN                          = 0x15
 COLOR_BLUE                           = 0x25
+COLOR_AQUA                           = 0x21
 COLOR_BLUE_DARK                      = 0x2D
 COLOR_WHITE                          = 0x08
+COLOR_EGYPT                          = 0x6C
 COLOR_ORANGE                         = 0x09
 COLOR_AMBER                          = 0x54
 COLOR_PURPLE                         = 0x51
 COLOR_PINK                           = 0x39
+COLOR_PINK_LIGHT                     = 0x52
 COLOR_YELLOW                         = 0x0D
 COLOR_LIME                           = 0x4B
+COLOR_LIME_LIGHT                     = 0x11
+COLOR_GREEN_YELLOW                   = 0x4A
 
 LED_BRIGHT_10                        = 0x00
 LED_BRIGHT_25                        = 0x01
@@ -132,12 +137,10 @@ LED_BRIGHT_65                        = 0x03
 LED_BRIGHT_75                        = 0x04
 LED_BRIGHT_90                        = 0x05
 LED_BRIGHT_100                       = 0x06
-
 LED_PULSING_16                       = 0x07
 LED_PULSING_8                        = 0x08
 LED_PULSING_4                        = 0x09
 LED_PULSING_2                        = 0x0A
-
 LED_BLINKING_24                      = 0x0B
 LED_BLINKING_16                      = 0x0C
 LED_BLINKING_8                       = 0x0D
@@ -147,18 +150,15 @@ LED_BLINKING_2                       = 0x0F
 # Function/State constants
 FN_VOLUME                            = 0x01
 FN_PAN                               = 0x02
-
 FN_SOLO                              = 0x03
 FN_MUTE                              = 0x04
 FN_REC_ARM                           = 0x05
 FN_SELECT                            = 0x06
 FN_SCENE                             = 0x07
-
 FN_SEQUENCE_MANAGER                  = 0x08
 FN_COPY_SEQUENCE                     = 0x09
 FN_MOVE_SEQUENCE                     = 0x0A
 FN_CLEAR_SEQUENCE                    = 0x0B
-
 FN_PLAY_NOTE                         = 0x0C
 FN_REMOVE_NOTE                       = 0x0D
 FN_REMOVE_PATTERN                    = 0x0F
@@ -177,7 +177,7 @@ PT_LONG_TIME                         = 2.0
 # --------------------------------------------------------------------------
 class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad):
 
-    dev_ids = ["APC Key 25 mk2 MIDI 2"]
+    dev_ids = ["APC Key 25 mk2 MIDI 2", "APC Key 25 mk2 IN 2"]
 
     def __init__(self, state_manager, idev_in, idev_out=None):
         self._leds = FeedbackLEDs(idev_out)
@@ -636,7 +636,7 @@ class BaseHandler:
     # These are actions requested to other handlers (shared between everyone)
     _pending_actions = []
 
-    def __init__(self, state_manager, leds):
+    def __init__(self, state_manager, leds: FeedbackLEDs):
         self._leds = leds
         self._state_manager = state_manager
         self._chain_manager = state_manager.chain_manager
@@ -717,12 +717,6 @@ class BaseHandler:
                 if c.midi_chan == channel),
             None
         )
-
-    # FIXME: Could this be in zynseq?
-    def _get_step_duration(self):
-        spb = self._libseq.getStepsPerBeat()
-        bpm = self._libseq.getTempo()
-        return int(60 / (spb * bpm) * 1000)  # ms
 
     # FIXME: Could this be in zynseq?
     def _set_note_duration(self, step, note, duration):
@@ -1826,7 +1820,8 @@ class NotePlayer(Thread):
             self._notes_pending.append(n)
             self._ready.set()
 
-    def play(self, note, velocity, duration_ms, channel=0, stutt_count=0, stutt_duration=1):
+    def play(self, note, velocity, duration, channel=0, stutt_count=0, stutt_duration=1):
+        duration_ms = int(self._get_step_duration() * duration)
         duration_cycles = duration_ms / self._clock_cycles_to_ms(1)
         with self._pending_lock:
             for n in self._notes_pending:
@@ -1854,6 +1849,12 @@ class NotePlayer(Thread):
                 except StopIteration:
                     self._notes_pending.remove(note)
 
+    # FIXME: Could this be in zynseq?
+    def _get_step_duration(self):
+        spb = self._libseq.getStepsPerBeat()
+        bpm = self._libseq.getTempo()
+        return int(60 / (spb * bpm) * 1000)  # ms
+
     def _send_note(self, mode, note, channel, velocity=0):
         status = 0x90 if mode == "on" else 0x80
         status |= (channel & 0xF)
@@ -1866,6 +1867,9 @@ class NotePlayer(Thread):
 #  Step Sequencer mode (StepSeq)
 # --------------------------------------------------------------------------
 class StepSeqHandler(BaseHandler):
+    PAD_COLS = 8
+    PAD_ROWS = 5
+
     NOTE_PAGE_COLORS = [
         COLOR_BLUE,
         COLOR_GREEN,
@@ -1873,7 +1877,7 @@ class StepSeqHandler(BaseHandler):
         COLOR_PINK,
     ]
 
-    def __init__(self, state_manager, leds, dev_idx):
+    def __init__(self, state_manager, leds: FeedbackLEDs, dev_idx):
         super().__init__(state_manager, leds)
         self._libseq = self._zynseq.libseq
         self._own_device_id = dev_idx
@@ -1881,6 +1885,7 @@ class StepSeqHandler(BaseHandler):
         self._knobs_ease = KnobSpeedControl(steps_normal=12, steps_shifted=20)
         self._saved_state = StepSeqState()
         self._note_player = NotePlayer(self._libseq)
+        self._note_config = None
 
         spb = self._libseq.getStepsPerBeat()
         self._clock = StepSyncProvider(spb, self._on_next_step)
@@ -1893,7 +1898,9 @@ class StepSeqHandler(BaseHandler):
         self._used_pads = 32
 
         self._is_select_pressed = False
+        self._is_volume_pressed = False
         self._is_stage_play = False
+        self._is_playing = False
         self._is_arranger_mode = False
 
         # We need to receive clock though MIDI
@@ -1901,9 +1908,9 @@ class StepSeqHandler(BaseHandler):
 
         # Pads ordered for cursor sliding + note pads
         self._pads = []
-        for r in range(5):
-            for c in reversed(range(8)):
-                self._pads.append(BTN_PAD_END - (r * 8 + c))
+        for r in range(self.PAD_ROWS):
+            for c in reversed(range(self.PAD_COLS)):
+                self._pads.append(BTN_PAD_END - (r * self.PAD_COLS + c))
 
         # 'Note-Pad' mapping (4 pages available)
         self._note_pads = None
@@ -1940,15 +1947,21 @@ class StepSeqHandler(BaseHandler):
     def _refresh_status_leds(self):
         self._leds.control_leds_off()
 
-        # If SHIFT is pressed, show this mode as active
         if self._is_shifted:
+            # If SHIFT is pressed, show this mode as active
             self._leds.led_on(BTN_KNOB_CTRL_SEND)
-            self._leds.led_on(BTN_UP + self._note_page_number)
+
+            if self._note_config is None:
+                self._leds.led_on(BTN_UP + self._note_page_number)
 
         if self._is_arranger_mode:
             self._leds.led_blink(BTN_SOFT_KEY_SELECT)
 
     def _refresh_note_pads(self):
+        # If there is a note config controller, it will handle all pads, nothing to do here
+        if self._note_config is not None:
+            return
+
         # On 'stage' playing, show patterns bar instead of note-pads
         if self._is_stage_play or self._is_arranger_mode:
             self._show_patterns_bar(overlay=False)
@@ -1970,6 +1983,11 @@ class StepSeqHandler(BaseHandler):
     def refresh(self, shifted_override=None, only_steps=False):
         self._on_shifted_override(shifted_override)
         self._refresh_status_leds()
+
+        if self._note_config is not None:
+            self._note_config.refresh(is_shifted=self._is_shifted)
+            return
+
         if not only_steps:
             self._refresh_note_pads()
         pads = {self._pads[idx]:None for idx in range(32)}
@@ -2003,7 +2021,11 @@ class StepSeqHandler(BaseHandler):
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
         self._refresh_status_leds()
-        self._refresh_note_pads()
+        if self._note_config is not None:
+            if not state:
+                self._note_config.refresh(only_status=True)
+        else:
+            self._refresh_note_pads()
         return retval
 
     def note_on(self, note, velocity, shifted_override=None):
@@ -2016,8 +2038,11 @@ class StepSeqHandler(BaseHandler):
             # Just changed to this mode, perform a refresh
             if note == BTN_KNOB_CTRL_SEND:
                 self.refresh()
+            if self._note_config is not None:
+                if BTN_PAD_START <= note <= BTN_PAD_END:
+                    return self._note_config.note_on(note, velocity, self._is_shifted)
             elif BTN_PAD_START <= note <= BTN_PAD_START + 7:
-                if not self._is_arranger_mode:
+                if not self._is_arranger_mode and self._note_config is None:
                     self._change_instrument(note)
             elif note == BTN_LEFT:
                 self._change_to_previous_pattern()
@@ -2039,10 +2064,26 @@ class StepSeqHandler(BaseHandler):
             return True
 
         else:
+            if BTN_SOFT_KEY_START <= note <= BTN_SOFT_KEY_END:
+                if self._note_config is None and self._is_volume_pressed:
+                    return self._create_note_control("velocity", note)
+                if note == BTN_SOFT_KEY_MUTE:
+                    if self._is_arranger_mode:
+                        self._note_pads_function = FN_CLEAR_PATTERN
+                elif note == BTN_SOFT_KEY_SELECT:
+                    self._enable_arranger_mode(False)
+                else:
+                    return False
+                return True
+
             if note == BTN_PLAY:
                 self._libseq.togglePlayState(self._zynseq.bank, self._selected_seq)
             elif BTN_PAD_START <= note <= BTN_PAD_END:
                 self._pressed_pads.add(note)
+                if self._is_volume_pressed and not self._is_arranger_mode:
+                    return self._create_note_control("velocity", note)
+                if self._note_config is not None:
+                    return self._note_config.note_on(note, velocity, self._is_shifted)
                 if BTN_PAD_START <= note <= BTN_PAD_START + 7:
                     self._run_note_pad_action(note, state=True)
             elif note == BTN_STOP_ALL_CLIPS:
@@ -2050,16 +2091,17 @@ class StepSeqHandler(BaseHandler):
                     self._note_pads_function = FN_REMOVE_PATTERN
                 else:
                     self._note_pads_function = FN_REMOVE_NOTE
-            elif note == BTN_SOFT_KEY_MUTE:
-                self._note_pads_function = FN_CLEAR_PATTERN
-            elif note == BTN_SOFT_KEY_SELECT:
-                self._enable_arranger_mode(False)
-            elif note == BTN_LEFT:
+            elif note == BTN_KNOB_CTRL_VOLUME:
+                self._is_volume_pressed = True
+                if self._note_config is not None:
+                    self._note_config = None
+                    self.refresh()
+            elif note == BTN_LEFT and self._note_config is None:
                 if self._is_arranger_mode:
                     self._change_to_previous_pattern()
                 else:
                     self._change_instruments_page(-1)
-            elif note == BTN_RIGHT:
+            elif note == BTN_RIGHT and self._note_config is None:
                 if self._is_arranger_mode:
                     self._change_to_next_pattern()
                 else:
@@ -2072,8 +2114,10 @@ class StepSeqHandler(BaseHandler):
         self._on_shifted_override(shifted_override)
 
         if BTN_PAD_START <= note <= BTN_PAD_END:
+            if self._note_config is not None:
+                return False
             if BTN_PAD_START <= note <= BTN_PAD_START + 7:
-                if not self._is_shifted:
+                if not self._is_shifted and not self._is_volume_pressed:
                     self._run_note_pad_action(note, state=False)
             elif note in self._pads[:self._used_pads]:
                 if self._pressed_pads_action is None:
@@ -2089,6 +2133,8 @@ class StepSeqHandler(BaseHandler):
                 self._note_pads_function = FN_PLAY_NOTE
         elif note == BTN_SOFT_KEY_SELECT:
             self._is_select_pressed = False
+        elif note == BTN_KNOB_CTRL_VOLUME:
+            self._is_volume_pressed = False
         else:
             return False
         return True
@@ -2147,8 +2193,12 @@ class StepSeqHandler(BaseHandler):
                 self._zynmixer.set_level(mixer_chan, level / 100)
 
     def update_seq_state(self, bank, seq, state=None, mode=None, group=None):
+        self._is_playing = state != zynseq.SEQ_STOPPED
         if state == zynseq.SEQ_STOPPED and self._cursor < self._used_pads:
             self._leds.remove_overlay(self._pads[self._cursor])
+        if self._note_config is not None:
+            is_playing = state != zynseq.SEQ_STOPPED
+            self._note_config.update_status(playing=is_playing)
 
     def _update_step_duration(self, step, delta):
         if self._selected_note is None:
@@ -2249,7 +2299,7 @@ class StepSeqHandler(BaseHandler):
 
         # Only in note-on event
         if state:
-            if len(self._pressed_pads) == 2:
+            if self._is_arranger_mode and len(self._pressed_pads) == 2:
                 src_idx = (self._pressed_pads - {dst_idx}).pop()
                 self._copy_pattern(src_idx, dst_idx)
                 self._leds.led_on(note, COLOR_LIME, LED_BLINKING_16, overlay=True)
@@ -2333,7 +2383,6 @@ class StepSeqHandler(BaseHandler):
 
         channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
         if on:
-            # duration_ms = int(self._get_step_duration() * note_spec.duration)
             self._note_player.play(
                 note_spec.note, velocity, 0, channel,
                 note_spec.stutter_count, note_spec.stutter_duration)
@@ -2348,12 +2397,12 @@ class StepSeqHandler(BaseHandler):
 
         note = self._selected_note.note
         velocity = self._libseq.getNoteVelocity(step, note)
-        duration_ms = int(self._get_step_duration() * self._libseq.getNoteDuration(step, note))
+        duration = self._libseq.getNoteDuration(step, note)
         channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
         stutt_count = self._libseq.getStutterCount(step, note)
         stutt_duration = self._libseq.getStutterDur(step, note)
         self._note_player.play(
-            note, velocity, duration_ms, channel, stutt_count, stutt_duration)
+            note, velocity, duration, channel, stutt_count, stutt_duration)
 
     def _toggle_step(self, step):
         if self._selected_note is None:
@@ -2602,7 +2651,6 @@ class StepSeqHandler(BaseHandler):
 
         num_steps = min(32, self._libseq.getSteps())
         note = self._selected_note.note
-
         duration = None
         for step in range(num_steps):
             is_old_note = duration != None
@@ -2617,11 +2665,148 @@ class StepSeqHandler(BaseHandler):
                 mode = (self._libseq.getNoteVelocity(step, note) * 6) // 127
             pad = self._pads[step]
             retval.append((pad, COLOR_AMBER if is_old_note else COLOR_RED, mode))
-
             if duration <= 1:
                 duration = None
                 continue
 
             duration -= 1
-
         return retval
+
+    def _create_note_control(self, kind, note):
+        notes = {}
+        row = None
+        if note == BTN_SOFT_KEY_SELECT:
+            row = note
+            notes = self._note_pads
+
+        elif BTN_SOFT_KEY_CLIP_STOP <= note <= BTN_SOFT_KEY_REC_ARM:
+            row = note
+
+        elif BTN_PAD_START <= note <= BTN_PAD_START + 7:
+            if note not in self._note_pads:
+                return False
+            notes[note] = self._note_pads[note]
+
+        else:
+            if self._selected_note is None:
+                return False
+            col = note % self.PAD_COLS
+            step = self._pads.index(note)
+            step_prx = StepProxy(self._libseq, self._selected_note.note, step)
+            if step_prx.duration <= 0:
+                return False
+            notes[col] = step_prx
+
+        channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
+        self._note_config = VelocityControl(self, notes, channel, row=row)
+        self.refresh()
+        return True
+
+
+# --------------------------------------------------------------------------
+#  Class to access individual steps using the same interface that pads uses,
+#  to be used by StepSeq's PropertyControls
+# --------------------------------------------------------------------------
+class StepProxy:
+    def __init__(self, libseq, note, step):
+        self._libseq = libseq
+        self._step = step
+
+        # These are public properties
+        self.note = note
+
+    @property
+    def velocity(self):
+        return self._libseq.getNoteVelocity(self._step, self.note)
+
+    @velocity.setter
+    def velocity(self, value):
+        return self._libseq.setNoteVelocity(self._step, self.note, value)
+
+    @property
+    def duration(self):
+        return self._libseq.getNoteDuration(self._step, self.note)
+
+    @property
+    def stutter_count(self):
+        return self._libseq.getStutterCount(self._step, self.note)
+
+    @property
+    def stutter_duration(self):
+        return self._libseq.getStutterDur(self._step, self.note)
+
+
+# --------------------------------------------------------------------------
+#  A controller utility to change velocity of a NotePad/Step
+# --------------------------------------------------------------------------
+class VelocityControl:
+    PAD_COLS = 8
+    PAD_ROWS = 5
+
+    # NOTE: This class is 'friend' (if you allow me the license) with StepSeqHandler
+    # so it will access some of its private members
+
+    def __init__(self, handler: StepSeqHandler, notes: dict, channel, row):
+        self._leds: FeedbackLEDs = handler._leds
+        self._player = handler._note_player
+        self._libseq = handler._libseq
+        self._is_playing = handler._is_playing
+        self._channel = channel
+        self._row = row
+        self._notes = notes
+
+    def refresh(self, only_steps=False, only_status=False, is_shifted=False):
+        if not only_steps and not is_shifted:
+            self._leds.led_on(BTN_KNOB_CTRL_VOLUME)
+            if self._row is not None:
+                self._leds.led_on(self._row)
+
+        if not only_status:
+            self._leds.pad_leds_off()
+            for pad, note in self._notes.items():
+                col = pad % self.PAD_COLS
+                self._draw_column(col, (note.velocity * 100) // 127)
+
+    def note_on(self, note, velocity, shifted_override=None):
+        col = (note - BTN_PAD_START) % self.PAD_COLS
+        note_spec = self._notes.get(col)
+        if note_spec is None:
+            return
+
+        row = (note - BTN_PAD_START) // self.PAD_COLS
+        current_value = round((note_spec.velocity * 100) / 127)
+        current_row = bisect([21, 41, 61, 81], current_value)
+        value = (row + 1) * 20
+        if row == current_row:
+            if current_value == value:
+                value -= 5 if shifted_override else 10
+            elif current_value == value - 5:
+                value -= 10 if shifted_override else 15
+            elif current_value == value - 10:
+                value -= 15 if shifted_override else 10
+            elif current_value == value - 15:
+                value -= 15
+
+        note_spec.velocity = round(value * 127 / 100)
+        self._draw_column(col, value)
+        self._play_note(note_spec)
+
+    def update_status(self, playing=False):
+        self._is_playing = playing
+
+    def _draw_column(self, col, value):
+        bright_values = [None, LED_BRIGHT_25, LED_BRIGHT_50, LED_BRIGHT_75, LED_BRIGHT_100]
+        for r in range(self.PAD_ROWS):
+            pad = r * self.PAD_COLS + col
+            brightness = bright_values[bisect([5, 10, 15, 20], value - (20 * r))]
+            if brightness is not None:
+                self._leds.led_on(pad, COLOR_AQUA, brightness)
+            else:
+                self._leds.led_off(pad)
+
+    def _play_note(self, note):
+        if not self._is_playing:
+            self._player.play(
+                note.note, note.velocity, note.duration,
+                self._channel, note.stutter_count, note.stutter_duration,
+            )
