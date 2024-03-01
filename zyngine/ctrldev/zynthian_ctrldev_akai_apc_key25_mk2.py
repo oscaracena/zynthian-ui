@@ -122,12 +122,14 @@ COLOR_WHITE                          = 0x08
 COLOR_EGYPT                          = 0x6C
 COLOR_ORANGE                         = 0x09
 COLOR_AMBER                          = 0x54
+COLOR_RUSSET                         = 0x3D
 COLOR_PURPLE                         = 0x51
 COLOR_PINK                           = 0x39
 COLOR_PINK_LIGHT                     = 0x52
+COLOR_PINK_WARM                      = 0x38
 COLOR_YELLOW                         = 0x0D
 COLOR_LIME                           = 0x4B
-COLOR_LIME_LIGHT                     = 0x11
+COLOR_LIME_DARK                      = 0x11
 COLOR_GREEN_YELLOW                   = 0x4A
 
 LED_BRIGHT_10                        = 0x00
@@ -1899,6 +1901,7 @@ class StepSeqHandler(BaseHandler):
 
         self._is_select_pressed = False
         self._is_volume_pressed = False
+        self._is_send_pressed = False
         self._is_stage_play = False
         self._is_playing = False
         self._is_arranger_mode = False
@@ -1918,7 +1921,7 @@ class StepSeqHandler(BaseHandler):
         self._note_pages = None
         self._note_page_number = 0
         self._notes_playing = {}
-        self._pressed_pads = set()
+        self._pressed_pads = {}
         self._pressed_pads_action = None
 
     def set_state(self, state):
@@ -2059,14 +2062,26 @@ class StepSeqHandler(BaseHandler):
                 if state in (zynseq.SEQ_STARTING, zynseq.SEQ_PLAYING, zynseq.SEQ_RESTARTING):
                     self._is_stage_play = True
                     self.refresh()
+            elif note == BTN_UP:
+                self._state_manager.send_cuia("BACK")
+            elif note == BTN_DOWN:
+                self._show_pattern_editor(self._selected_seq)
             else:
                 return False
             return True
 
         else:
             if BTN_SOFT_KEY_START <= note <= BTN_SOFT_KEY_END:
-                if self._note_config is None and self._is_volume_pressed:
-                    return self._create_note_control("velocity", note)
+                control = None
+                if self._note_config is not None:
+                    control = self._note_config.KIND
+                elif self._is_volume_pressed:
+                    control = VelocityControl.KIND
+                elif self._is_send_pressed:
+                    control = StutterCountControl.KIND
+                if control is not None:
+                    return self._create_note_control(control, note)
+
                 if note == BTN_SOFT_KEY_MUTE:
                     if self._is_arranger_mode:
                         self._note_pads_function = FN_CLEAR_PATTERN
@@ -2078,24 +2093,54 @@ class StepSeqHandler(BaseHandler):
 
             if note == BTN_PLAY:
                 self._libseq.togglePlayState(self._zynseq.bank, self._selected_seq)
+
             elif BTN_PAD_START <= note <= BTN_PAD_END:
-                self._pressed_pads.add(note)
-                if self._is_volume_pressed and not self._is_arranger_mode:
-                    return self._create_note_control("velocity", note)
+                self._pressed_pads[note] = time.time()
+                if len(self._pressed_pads) == 2:
+                    return self._extend_step(note)
+                if not self._is_arranger_mode:
+                    control = None
+                    if self._is_volume_pressed:
+                        control = VelocityControl.KIND
+                    elif self._is_send_pressed:
+                        control = StutterCountControl.KIND
+                    if control is not None:
+                        return self._create_note_control(control, note)
+
                 if self._note_config is not None:
                     return self._note_config.note_on(note, velocity, self._is_shifted)
                 if BTN_PAD_START <= note <= BTN_PAD_START + 7:
                     self._run_note_pad_action(note, state=True)
+
             elif note == BTN_STOP_ALL_CLIPS:
                 if self._is_arranger_mode:
                     self._note_pads_function = FN_REMOVE_PATTERN
                 else:
                     self._note_pads_function = FN_REMOVE_NOTE
+
             elif note == BTN_KNOB_CTRL_VOLUME:
                 self._is_volume_pressed = True
                 if self._note_config is not None:
-                    self._note_config = None
+                    if self._note_config.KIND == VelocityControl.KIND:
+                        self._note_config = None
+                    else:
+                        self._note_config = self._note_config.clone_to(
+                            VelocityControl.KIND)
                     self.refresh()
+
+            elif note == BTN_KNOB_CTRL_SEND:
+                self._is_send_pressed = True
+                if self._note_config is not None:
+                    if self._note_config.KIND == StutterCountControl.KIND:
+                        self._note_config = self._note_config.clone_to(
+                            StutterDurationControl.KIND)
+                    elif self._note_config.KIND == StutterDurationControl.KIND:
+                        self._note_config = None
+                    else:
+                        self._note_config = self._note_config.clone_to(
+                            StutterCountControl.KIND)
+                    self.refresh()
+
             elif note == BTN_LEFT and self._note_config is None:
                 if self._is_arranger_mode:
                     self._change_to_previous_pattern()
@@ -2114,16 +2159,19 @@ class StepSeqHandler(BaseHandler):
         self._on_shifted_override(shifted_override)
 
         if BTN_PAD_START <= note <= BTN_PAD_END:
+            if note in self._pressed_pads:
+                self._pressed_pads.pop(note, None)
+
             if self._note_config is not None:
-                return False
+                self._pressed_pads_action = "note-config"
+
             if BTN_PAD_START <= note <= BTN_PAD_START + 7:
-                if not self._is_shifted and not self._is_volume_pressed:
+                if not self._is_shifted and self._note_config is None:
                     self._run_note_pad_action(note, state=False)
             elif note in self._pads[:self._used_pads]:
                 if self._pressed_pads_action is None:
                     self._toggle_step(self._pads.index(note))
-            if note in self._pressed_pads:
-                self._pressed_pads.discard(note)
+
             if not self._pressed_pads:
                 self._pressed_pads_action = None
         elif note in (BTN_STOP_ALL_CLIPS, BTN_SOFT_KEY_MUTE):
@@ -2135,6 +2183,8 @@ class StepSeqHandler(BaseHandler):
             self._is_select_pressed = False
         elif note == BTN_KNOB_CTRL_VOLUME:
             self._is_volume_pressed = False
+        elif note == BTN_KNOB_CTRL_SEND:
+            self._is_send_pressed = False
         else:
             return False
         return True
@@ -2145,6 +2195,9 @@ class StepSeqHandler(BaseHandler):
             return
 
         if self._pressed_pads:
+            if self._note_config is not None:
+                return False
+
             adjust_pad_func = {
                 KNOB_1: self._update_note_pad_duration,
                 KNOB_2: self._update_note_pad_velocity,
@@ -2199,6 +2252,31 @@ class StepSeqHandler(BaseHandler):
         if self._note_config is not None:
             is_playing = state != zynseq.SEQ_STOPPED
             self._note_config.update_status(playing=is_playing)
+
+    def _extend_step(self, pad_end):
+        pad_start = next(pad for pad in self._pressed_pads if pad != pad_end)
+        ts = self._pressed_pads.get(pad_start, 0)
+        if time.time() - ts < 0.5:
+            return
+        step_pads = self._pads[:self._used_pads]
+        try:
+            step_start = step_pads.index(pad_start)
+            step_end = step_pads.index(pad_end)
+        except ValueError:
+            return
+        if step_start >= step_end:
+            return
+        note = self._selected_note.note
+        current_duration = self._libseq.getNoteDuration(step_start, note)
+        if current_duration == 0:
+            return
+
+        self._pressed_pads_action = "extend-step"
+        new_duration = step_end - step_start + 1
+        if new_duration == current_duration:
+            new_duration -= 0.5
+        self._set_note_duration(step_start, note, new_duration)
+        self.refresh(only_steps=True)
 
     def _update_step_duration(self, step, delta):
         if self._selected_note is None:
@@ -2300,7 +2378,7 @@ class StepSeqHandler(BaseHandler):
         # Only in note-on event
         if state:
             if self._is_arranger_mode and len(self._pressed_pads) == 2:
-                src_idx = (self._pressed_pads - {dst_idx}).pop()
+                src_idx = next(pad for pad in self._pressed_pads if pad != dst_idx)
                 self._copy_pattern(src_idx, dst_idx)
                 self._leds.led_on(note, COLOR_LIME, LED_BLINKING_16, overlay=True)
                 self._leds.delayed("remove_overlay", 1000, note)
@@ -2673,14 +2751,32 @@ class StepSeqHandler(BaseHandler):
         return retval
 
     def _create_note_control(self, kind, note):
+        available = [VelocityControl, StutterCountControl, StutterDurationControl]
+        for Control in available:
+            if Control.KIND == kind:
+                break
+        else:
+            print(f"ERROR: Control kind not supported: {kind}")
+            return False
+
         notes = {}
-        row = None
+        row_led = None
         if note == BTN_SOFT_KEY_SELECT:
-            row = note
+            row_led = note
             notes = self._note_pads
 
         elif BTN_SOFT_KEY_CLIP_STOP <= note <= BTN_SOFT_KEY_REC_ARM:
-            row = note
+            row = note - BTN_SOFT_KEY_CLIP_STOP
+
+            # Skip not used rows
+            if (row + 1) * self.PAD_COLS - self._used_pads >= self.PAD_COLS:
+                return False
+
+            row_led = note
+            for step in range(self.PAD_COLS * row, self.PAD_COLS * (row + 1)):
+                step_prx = StepProxy(self._libseq, self._selected_note.note, step)
+                if step_prx.duration > 0:
+                    notes[step % self.PAD_COLS] = step_prx
 
         elif BTN_PAD_START <= note <= BTN_PAD_START + 7:
             if note not in self._note_pads:
@@ -2698,7 +2794,7 @@ class StepSeqHandler(BaseHandler):
             notes[col] = step_prx
 
         channel = self._libseq.getChannel(self._zynseq.bank, self._selected_seq, 0)
-        self._note_config = VelocityControl(self, notes, channel, row=row)
+        self._note_config = Control(self, notes, channel, row_led=row_led)
         self.refresh()
         return True
 
@@ -2721,7 +2817,7 @@ class StepProxy:
 
     @velocity.setter
     def velocity(self, value):
-        return self._libseq.setNoteVelocity(self._step, self.note, value)
+        self._libseq.setNoteVelocity(self._step, self.note, value)
 
     @property
     def duration(self):
@@ -2731,41 +2827,72 @@ class StepProxy:
     def stutter_count(self):
         return self._libseq.getStutterCount(self._step, self.note)
 
+    @stutter_count.setter
+    def stutter_count(self, value):
+        self._libseq.setStutterCount(self._step, self.note, value)
+
     @property
     def stutter_duration(self):
         return self._libseq.getStutterDur(self._step, self.note)
 
+    @stutter_duration.setter
+    def stutter_duration(self, value):
+        self._libseq.setStutterDur(self._step, self.note, value)
+
 
 # --------------------------------------------------------------------------
-#  A controller utility to change velocity of a NotePad/Step
+#  Base of controller utilities to change some property of a NotePad/Step
 # --------------------------------------------------------------------------
-class VelocityControl:
-    PAD_COLS = 8
-    PAD_ROWS = 5
+class BaseControl:
+    KIND            = "undefined"
+    PAD_COLS        = 8
+    PAD_ROWS        = 5
+    INDICATOR_LED   = None
+    INDICATOR_BLINK = False
+    COLOR           = COLOR_PURPLE
+
+    STEPS           = [20, 40, 60, 80, 100]
+    HALF_STEPS      = [10, 30, 50, 70, 90]
 
     # NOTE: This class is 'friend' (if you allow me the license) with StepSeqHandler
     # so it will access some of its private members
 
-    def __init__(self, handler: StepSeqHandler, notes: dict, channel, row):
+    def __init__(self, handler: StepSeqHandler, notes: dict, channel, row_led):
         self._leds: FeedbackLEDs = handler._leds
-        self._player = handler._note_player
+        self._note_player = handler._note_player
         self._libseq = handler._libseq
         self._is_playing = handler._is_playing
+
         self._channel = channel
-        self._row = row
+        self._row_led = row_led
         self._notes = notes
+
+    def clone_to(self, kind):
+        available = [VelocityControl, StutterCountControl, StutterDurationControl]
+        for Control in available:
+            if Control.KIND == kind:
+                return Control(self, self._notes, self._channel, self._row_led)
+        raise TypeError(f"Unknown kind to clone to: {kind}")
 
     def refresh(self, only_steps=False, only_status=False, is_shifted=False):
         if not only_steps and not is_shifted:
-            self._leds.led_on(BTN_KNOB_CTRL_VOLUME)
-            if self._row is not None:
-                self._leds.led_on(self._row)
+            if self.INDICATOR_LED is not None:
+                if self.INDICATOR_BLINK:
+                    self._leds.led_blink(self.INDICATOR_LED)
+                else:
+                    self._leds.led_on(self.INDICATOR_LED)
+            if self._row_led is not None:
+                self._leds.led_on(self._row_led)
 
         if not only_status:
             self._leds.pad_leds_off()
             for pad, note in self._notes.items():
                 col = pad % self.PAD_COLS
-                self._draw_column(col, (note.velocity * 100) // 127)
+                value = self._get_note_property(note)
+                self._draw_column(col, value)
+
+    def update_status(self, playing=False):
+        self._is_playing = playing
 
     def note_on(self, note, velocity, shifted_override=None):
         col = (note - BTN_PAD_START) % self.PAD_COLS
@@ -2774,39 +2901,92 @@ class VelocityControl:
             return
 
         row = (note - BTN_PAD_START) // self.PAD_COLS
-        current_value = round((note_spec.velocity * 100) / 127)
-        current_row = bisect([21, 41, 61, 81], current_value)
-        value = (row + 1) * 20
-        if row == current_row:
-            if current_value == value:
-                value -= 5 if shifted_override else 10
-            elif current_value == value - 5:
-                value -= 10 if shifted_override else 15
-            elif current_value == value - 10:
-                value -= 15 if shifted_override else 10
-            elif current_value == value - 15:
-                value -= 15
+        current_value = self._get_note_property(note_spec)
 
-        note_spec.velocity = round(value * 127 / 100)
+        if shifted_override:
+            value = 0
+        else:
+            value = self.STEPS[row]
+            if value == current_value:
+                value = self.HALF_STEPS[row]
+
+        self._set_note_property(note_spec, value)
         self._draw_column(col, value)
         self._play_note(note_spec)
 
-    def update_status(self, playing=False):
-        self._is_playing = playing
-
-    def _draw_column(self, col, value):
-        bright_values = [None, LED_BRIGHT_25, LED_BRIGHT_50, LED_BRIGHT_75, LED_BRIGHT_100]
-        for r in range(self.PAD_ROWS):
-            pad = r * self.PAD_COLS + col
-            brightness = bright_values[bisect([5, 10, 15, 20], value - (20 * r))]
-            if brightness is not None:
-                self._leds.led_on(pad, COLOR_AQUA, brightness)
-            else:
-                self._leds.led_off(pad)
-
     def _play_note(self, note):
         if not self._is_playing:
-            self._player.play(
-                note.note, note.velocity, note.duration,
-                self._channel, note.stutter_count, note.stutter_duration,
-            )
+            self._note_player.play(note.note, note.velocity, note.duration,
+                self._channel, note.stutter_count, note.stutter_duration)
+
+    def _draw_column(self, col, value):
+        bright_values = [None, LED_BRIGHT_50, LED_BRIGHT_100]
+
+        for r in range(self.PAD_ROWS):
+            pad = r * self.PAD_COLS + col
+            brightness = bright_values[bisect((self.HALF_STEPS[r], self.STEPS[r]), value)]
+            if brightness is not None:
+                self._leds.led_on(pad, self.COLOR, brightness)
+            else:
+                self._leds.led_on(pad, COLOR_PINK_WARM, LED_BRIGHT_10)
+
+    def _get_note_property(self, note):
+        raise NotImplementedError(f"{self.__class__.__name__}._get_note_property()")
+
+    def _set_note_property(self, note, value):
+        raise NotImplementedError(f"{self.__class__.__name__}._set_note_property()")
+
+
+# --------------------------------------------------------------------------
+#  A controller utility to change velocity of a NotePad/Step
+# --------------------------------------------------------------------------
+class VelocityControl(BaseControl):
+    KIND            = "velocity"
+    INDICATOR_LED   = BTN_KNOB_CTRL_VOLUME
+    COLOR           = COLOR_AQUA
+
+    STEPS           = [25, 50, 76, 101, 127]
+    HALF_STEPS      = [12, 38, 63, 88, 114]
+
+    def _get_note_property(self, note):
+        return note.velocity
+
+    def _set_note_property(self, note, value):
+        note.velocity = value
+
+
+# --------------------------------------------------------------------------
+#  A controller utility to change stutter count of a NotePad/Step
+# --------------------------------------------------------------------------
+class StutterCountControl(BaseControl):
+    KIND            = "stutter-count"
+    INDICATOR_LED   = BTN_KNOB_CTRL_SEND
+    COLOR           = COLOR_LIME_DARK
+
+    STEPS           = [2, 4, 8, 12, 20]
+    HALF_STEPS      = [1, 3, 6, 10, 15]
+
+    def _get_note_property(self, note):
+        return note.stutter_count
+
+    def _set_note_property(self, note, value):
+        note.stutter_count = value
+
+
+# --------------------------------------------------------------------------
+#  A controller utility to change stutter duration of a NotePad/Step
+# --------------------------------------------------------------------------
+class StutterDurationControl(BaseControl):
+    KIND            = "stutter-duration"
+    INDICATOR_LED   = BTN_KNOB_CTRL_SEND
+    INDICATOR_BLINK = True
+    COLOR           = COLOR_RUSSET
+
+    STEPS           = [2, 4, 8, 20, 40]
+    HALF_STEPS      = [1, 3, 6, 10, 30]
+
+    def _get_note_property(self, note):
+        return note.stutter_duration
+
+    def _set_note_property(self, note, value):
+        note.stutter_duration = value
