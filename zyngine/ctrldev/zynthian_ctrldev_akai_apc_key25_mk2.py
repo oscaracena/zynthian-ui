@@ -312,7 +312,9 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
                 elif note == BTN_RECORD and not self._is_shifted:
                     return self._padmatrix_handler.on_record_changed(True)
                 elif note == BTN_PLAY:
-                    return self._padmatrix_handler.on_toggle_play()
+                    if not self._is_shifted:
+                        return self._padmatrix_handler.on_toggle_play()
+                    self._padmatrix_handler.note_on(note, value, self._is_shifted)
                 elif (BTN_SOFT_KEY_START <= note <= BTN_SOFT_KEY_END
                       and not self._is_shifted):
                     row = note - BTN_SOFT_KEY_START
@@ -703,10 +705,6 @@ class BaseHandler:
         self._state_manager.stop_midi_playback()
         self._state_manager.stop_audio_player()
 
-        # FIXME: oram -> AttributeError: 'zynthian_engine_audioplayer' object has no attribute 'player'
-        # self._state_manager.audio_player.engine.player.set_position(
-        #     self._state_manager.audio_player.handle, 0.0)
-
     def _on_shifted_override(self, override=None):
         if override is not None:
             self._is_shifted = override
@@ -1062,7 +1060,9 @@ class MixerHandler(BaseHandler):
             elif note == BTN_RIGHT:
                 self._chains_bank = 1
             elif note == BTN_STOP_ALL_CLIPS:
-                self._run_track_button_function_on_channel(255)
+                self._stop_all_sounds()
+            elif note == BTN_PLAY:
+                self._run_track_button_function_on_channel(255, FN_MUTE)
             elif note == BTN_SOFT_KEY_SELECT:
                 self._track_buttons_function = FN_SELECT
             elif note == BTN_RECORD:
@@ -1164,24 +1164,27 @@ class MixerHandler(BaseHandler):
 
         return self._run_track_button_function_on_channel(chain)
 
-    def _run_track_button_function_on_channel(self, chain):
+    def _run_track_button_function_on_channel(self, chain, function=None):
         if isinstance(chain, int):
             channel = chain
             chain = None
         else:
             channel = chain.mixer_chan
 
-        if self._track_buttons_function == FN_MUTE:
+        if function is None:
+            function = self._track_buttons_function
+
+        if function == FN_MUTE:
             val = self._zynmixer.get_mute(channel) ^ 1
             self._zynmixer.set_mute(channel, val, True)
             return True
 
-        if self._track_buttons_function == FN_SOLO:
+        if function == FN_SOLO:
             val = self._zynmixer.get_solo(channel) ^ 1
             self._zynmixer.set_solo(channel, val, True)
             return True
 
-        if self._track_buttons_function == FN_SELECT and chain is not None:
+        if function == FN_SELECT and chain is not None:
             self._chain_manager.set_active_chain_by_id(chain.chain_id)
             return True
 
@@ -2096,8 +2099,9 @@ class StepSeqHandler(BaseHandler):
 
             elif BTN_PAD_START <= note <= BTN_PAD_END:
                 self._pressed_pads[note] = time.time()
-                if len(self._pressed_pads) == 2:
-                    return self._extend_step(note)
+                if BTN_PAD_START + 8 <= note <= BTN_PAD_END:
+                    if len(self._pressed_pads) == 2:
+                        return self._extend_step(note)
                 if not self._is_arranger_mode:
                     control = None
                     if self._is_volume_pressed:
