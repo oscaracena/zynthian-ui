@@ -459,8 +459,6 @@ class ButtonTimer(Thread):
             self._callback(note, ptype)
         except Exception as ex:
             print(f"ERROR in handler: {ex}")
-            from traceback import print_exc
-            print_exc()
 
 
 # --------------------------------------------------------------------------
@@ -1354,7 +1352,7 @@ class PadMatrixHandler(BaseHandler):
         if self._seqman_func is not None:
             self._seqman_handle_pad_press(seq)
         elif self._track_btn_pressed is not None:
-            self._clear_pattern((self._zynseq.bank, seq))
+            self._clear_sequence(self._zynseq.bank, seq)
         elif self._is_record_pressed:
             self._start_pattern_record(seq)
         elif self._recording_seq == seq:
@@ -1434,7 +1432,7 @@ class PadMatrixHandler(BaseHandler):
         seq_is_empty = self._libseq.isEmpty(self._zynseq.bank, seq)
         if self._seqman_func == FN_CLEAR_SEQUENCE:
             if not seq_is_empty:
-                self._clear_pattern((self._zynseq.bank, seq))
+                self._clear_sequence(self._zynseq.bank, seq)
             return
 
         # Set selected sequence as source
@@ -1448,10 +1446,10 @@ class PadMatrixHandler(BaseHandler):
             # Copy/Move source to selected sequence (will be overwritten)
             else:
                 if self._seqman_func == FN_COPY_SEQUENCE:
-                    self._copy_pattern(self._seqman_src_seq, seq)
+                    self._copy_sequence(*self._seqman_src_seq, self._zynseq.bank, seq)
                 elif self._seqman_func == FN_MOVE_SEQUENCE:
-                    self._copy_pattern(self._seqman_src_seq, seq)
-                    self._clear_pattern(self._seqman_src_seq)
+                    self._copy_sequence(*self._seqman_src_seq, self._zynseq.bank, seq)
+                    self._clear_sequence(*self._seqman_src_seq)
                     self._seqman_src_seq = None
 
         self._update_pad(seq)
@@ -1529,24 +1527,60 @@ class PadMatrixHandler(BaseHandler):
         self._recording_seq = None
         self.refresh()
 
-    def _clear_pattern(self, seq):
-        scene, seq = seq
-        pattern = self._libseq.getPattern(scene, seq, 0, 0)
-        self._libseq.selectPattern(pattern)
-        self._libseq.clear()
-        self._libseq.updateSequenceInfo()
-        self._update_pad(seq)
+    def _clear_sequence(self, scene, seq, create_empty=True):
+        # Remove all patterns in all tracks
+        seq_len = self._libseq.getSequenceLength(scene, seq)
+        if seq_len != 0:
+            n_tracks = self._libseq.getTracksInSequence(scene, seq)
+            for track in range(n_tracks):
+                n_patts = self._libseq.getPatternsInTrack(scene, seq, track)
+                if n_patts == 0:
+                    continue
+                pos = 0
+                while pos < seq_len:
+                    pattern = self._libseq.getPatternAt(scene, seq, track, pos)
+                    if pattern != -1:
+                        self._libseq.removePattern(scene, seq, track, pos)
+                        pos += self._libseq.getPatternLength(pattern)
+                    else:
+                        # Arranger's offset step is a quarter note (24 clocks)
+                        pos += 24
 
-    def _copy_pattern(self, src, dst):
-        scene_src, seq_src = src
-        patt_src = self._libseq.getPattern(scene_src, seq_src, 0, 0)
-        patt_dst = self._libseq.getPattern(self._zynseq.bank, dst, 0, 0)
-        self._libseq.copyPattern(patt_src, patt_dst)
-        self._libseq.updateSequenceInfo()
+            if n_tracks > 0:
+                for track in range(n_tracks-1):
+                    self._libseq.removeTrackFromSequence(scene, seq, track)
+
+        # Add a new empty pattern at the beginning of first track
+        if create_empty:
+            pattern = self._libseq.createPattern()
+            self._libseq.addPattern(scene, seq, 0, 0, pattern)
+
+    def _copy_sequence(self, src_scene, src_seq, dst_scene, dst_seq):
+        self._clear_sequence(dst_scene, dst_seq, create_empty=False)
+
+        # Copy all patterns in all tracks
+        seq_len = self._libseq.getSequenceLength(src_scene, src_seq)
+        if seq_len != 0:
+            n_tracks = self._libseq.getTracksInSequence(src_scene, src_seq)
+            for track in range(n_tracks):
+                if track >= self._libseq.getTracksInSequence(dst_scene, dst_seq):
+                    self._libseq.addTrackToSequence(dst_scene, dst_seq)
+                n_patts = self._libseq.getPatternsInTrack(src_scene, src_seq, track)
+                if n_patts == 0:
+                    continue
+                pos = 0
+                while pos < seq_len:
+                    pattern = self._libseq.getPatternAt(src_scene, src_seq, track, pos)
+                    if pattern != -1:
+                        self._libseq.addPattern(dst_scene, dst_seq, track, pos, pattern)
+                        pos += self._libseq.getPatternLength(pattern)
+                    else:
+                        # Arranger's offset step is a quarter note (24 clocks)
+                        pos += 24
 
         # Also copy StepSeq instrument pages
         self._request_action("stepseq", "sync-sequences",
-            scene_src, seq_src, self._zynseq.bank, dst)
+            src_scene, src_seq, dst_scene, dst_seq)
 
 
 # --------------------------------------------------------------------------
@@ -1679,8 +1713,8 @@ class NotePad(dict):
     def __getattr__(self, name):
         try:
             return self[name]
-        except IndexError as err:
-            raise AttributeError(err.args[0]) from None
+        except (IndexError, KeyError):
+            return super().__getattr__(name)
 
     def __setattr__(self, name, value):
         self[name] = value
@@ -1948,6 +1982,7 @@ class StepSeqHandler(BaseHandler):
             if self._is_arranger_mode:
                 self._enable_arranger_mode(False)
             self._clock.disable()
+            self._is_stage_play = False
         self._pressed_pads_action = "activation"
 
     def _refresh_status_leds(self):
@@ -2041,9 +2076,13 @@ class StepSeqHandler(BaseHandler):
             self.refresh()
 
         if self._is_shifted:
-            # Just changed to this mode, perform a refresh
+            # Events that will run independently of note_config
             if note == BTN_KNOB_CTRL_SEND:
                 self.refresh()
+            elif note == BTN_STOP_ALL_CLIPS:
+                self._stop_all_sounds()
+
+            # Events that depends on note_config
             if self._note_config is not None:
                 if BTN_PAD_START <= note <= BTN_PAD_END:
                     return self._note_config.note_on(note, velocity, self._is_shifted)
@@ -2054,8 +2093,6 @@ class StepSeqHandler(BaseHandler):
                 self._change_to_previous_pattern()
             elif note == BTN_RIGHT:
                 self._change_to_next_pattern()
-            elif note == BTN_STOP_ALL_CLIPS:
-                self._stop_all_sounds()
             elif note == BTN_SOFT_KEY_SELECT:
                 self._is_select_pressed = True
                 self._enable_arranger_mode(True)
