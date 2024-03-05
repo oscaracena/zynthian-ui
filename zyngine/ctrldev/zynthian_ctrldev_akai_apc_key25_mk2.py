@@ -23,10 +23,6 @@
 #
 #******************************************************************************
 
-# FIXME: Add support for:
-# - sequences with more than one track
-# - sequences with more thant one pattern
-# - patterns that has offsets
 
 import time
 import multiprocessing as mp
@@ -716,6 +712,43 @@ class BaseHandler:
             None
         )
 
+    # FIXME: Could this (or part of this) be in zynseq?
+    def _get_sequence_patterns(self, bank, seq, create=False):
+        seq_len = self._libseq.getSequenceLength(bank, seq)
+        pattern = -1
+        retval = []
+
+        if seq_len == 0:
+            if create:
+                pattern = self._libseq.createPattern()
+                self._libseq.addPattern(bank, seq, 0, 0, pattern)
+                retval.append(pattern)
+            return retval
+
+        n_tracks = self._libseq.getTracksInSequence(bank, seq)
+        for track in range(n_tracks):
+            retval.extend(self._get_patterns_in_track(bank, seq, track))
+        return retval
+
+    # FIXME: Could this be in zynseq?
+    def _get_patterns_in_track(self, bank, seq, track):
+        retval = []
+        n_patts = self._libseq.getPatternsInTrack(bank, seq, track)
+        if n_patts == 0:
+            return retval
+
+        seq_len = self._libseq.getSequenceLength(bank, seq)
+        pos = 0
+        while pos < seq_len:
+            pattern = self._libseq.getPatternAt(bank, seq, track, pos)
+            if pattern != -1:
+                retval.append(pattern)
+                pos += self._libseq.getPatternLength(pattern)
+            else:
+                # Arranger's offset step is a quarter note (24 clocks)
+                pos += 24
+        return retval
+
     # FIXME: Could this be in zynseq?
     def _set_note_duration(self, step, note, duration):
         velocity = self._libseq.getNoteVelocity(step, note)
@@ -1372,8 +1405,10 @@ class PadMatrixHandler(BaseHandler):
         if idx >= len(self._pads):
             return
         btn = self._pads[idx]
-        pattern = self._libseq.getPattern(bank, seq, 0, 0)
-        is_empty = self._zynseq.is_pattern_empty(pattern)
+
+        is_empty = all(
+            self._zynseq.is_pattern_empty(pattern)
+            for pattern in self._get_sequence_patterns(bank, seq))
         color = self.GROUP_COLORS[group]
 
         # If seqman is enabled, update according to it's function
@@ -1572,7 +1607,9 @@ class PadMatrixHandler(BaseHandler):
                 while pos < seq_len:
                     pattern = self._libseq.getPatternAt(src_scene, src_seq, track, pos)
                     if pattern != -1:
-                        self._libseq.addPattern(dst_scene, dst_seq, track, pos, pattern)
+                        new_pattern = self._libseq.createPattern()
+                        self._libseq.copyPattern(pattern, new_pattern)
+                        self._libseq.addPattern(dst_scene, dst_seq, track, pos, new_pattern)
                         pos += self._libseq.getPatternLength(pattern)
                     else:
                         # Arranger's offset step is a quarter note (24 clocks)
@@ -2727,41 +2764,6 @@ class StepSeqHandler(BaseHandler):
                 pos -= 24
 
         return self._libseq.addPattern(bank, seq, track, pos, pattern)
-
-    def _get_sequence_patterns(self, bank, seq, create=False):
-        seq_len = self._libseq.getSequenceLength(bank, seq)
-        pattern = -1
-        retval = []
-
-        if seq_len == 0:
-            if create:
-                pattern = self._libseq.createPattern()
-                self._libseq.addPattern(bank, seq, 0, 0, pattern)
-                retval.append(pattern)
-            return retval
-
-        n_tracks = self._libseq.getTracksInSequence(bank, seq)
-        for track in range(n_tracks):
-            retval.extend(self._get_patterns_in_track(bank, seq, track))
-        return retval
-
-    def _get_patterns_in_track(self, bank, seq, track):
-        retval = []
-        n_patts = self._libseq.getPatternsInTrack(bank, seq, track)
-        if n_patts == 0:
-            return retval
-
-        seq_len = self._libseq.getSequenceLength(bank, seq)
-        pos = 0
-        while pos < seq_len:
-            pattern = self._libseq.getPatternAt(bank, seq, track, pos)
-            if pattern != -1:
-                retval.append(pattern)
-                pos += self._libseq.getPatternLength(pattern)
-            else:
-                # Arranger's offset step is a quarter note (24 clocks)
-                pos += 24
-        return retval
 
     def _get_step_colors(self):
         retval = []
