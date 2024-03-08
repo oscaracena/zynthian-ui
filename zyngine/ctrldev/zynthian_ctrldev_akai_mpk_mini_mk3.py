@@ -23,7 +23,7 @@
 #
 #******************************************************************************
 
-from functools import partial
+import time
 from zyngine.zynthian_signal_manager import zynsigman
 from zyncoder.zyncore import lib_zyncore
 from zyngine.ctrldev.zynthian_ctrldev_base import (
@@ -106,17 +106,20 @@ KNOB_MODE_REL               = 1
 DEFAULT_KEYBED_CH           = 0
 DEFAULT_PADS_CH             = 9
 
-# PC numbers for changing mode
+# PC numbers for related actions
 PROG_MIXPAD_MODE            = 4
 PROG_DEVICE_MODE            = 5
 PROG_PATTERN_MODE           = 6
+PROG_NOTEPAD_MODE           = 7
+PROG_OPEN_MIXER             = 0
+PROG_OPEN_ZYNPAD            = 1
 
 # Function/State constants
 FN_VOLUME                            = 0x01
 FN_PAN                               = 0x02
 FN_SOLO                              = 0x03
 FN_MUTE                              = 0x04
-# FN_SELECT                            = 0x06
+FN_SELECT                            = 0x06
 # FN_SCENE                             = 0x07
 
 
@@ -206,6 +209,7 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
         self._mixpad_handler = MixPadHandler(state_manager, idev_out)
         self._device_handler = DeviceHandler(state_manager, idev_out)
         self._pattern_handler = PatternHandler(state_manager, idev_out)
+        self._notepad_handler = NotePadHandler(state_manager, idev_out)
         self._current_handler = self._mixpad_handler
         self._current_handler.set_active(True)
 
@@ -229,6 +233,7 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
     def midi_event(self, ev: int):
         # print(" ".join(f"{b:02X}" for b in ev.to_bytes(3, "big")))
         evtype = (ev & 0xF00000) >> 20
+        channel = (ev & 0x0F0000) >> 16
 
         if evtype == CONST.MIDI_PC:
             program = (ev >> 8) & 0x7F
@@ -238,19 +243,21 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
                 self._change_handler(self._device_handler)
             elif program == PROG_PATTERN_MODE:
                 self._change_handler(self._pattern_handler)
+            elif program == PROG_NOTEPAD_MODE:
+                self._change_handler(self._notepad_handler)
+            elif program == PROG_OPEN_MIXER:
+                self.state_manager.send_cuia("SCREEN_AUDIO_MIXER")
+            elif program == PROG_OPEN_ZYNPAD:
+                self.state_manager.send_cuia("SCREEN_ZYNPAD")
 
         elif evtype == CONST.MIDI_NOTE_ON:
-            if (ev & 0x0F0000) >> 16 == DEFAULT_KEYBED_CH:
-                return
             note = (ev >> 8) & 0x7F
             velocity = ev & 0x7F
-            self._current_handler.note_on(note, velocity)
+            self._current_handler.note_on(note, channel, velocity)
 
         elif evtype == CONST.MIDI_NOTE_OFF:
-            if (ev & 0x0F0000) >> 16 == DEFAULT_KEYBED_CH:
-                return
             note = (ev >> 8) & 0x7F
-            self._current_handler.note_off(note)
+            self._current_handler.note_off(note, channel)
 
         elif evtype == CONST.MIDI_CC:
             ccnum = (ev >> 8) & 0x7F
@@ -275,24 +282,26 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
 # --------------------------------------------------------------------------
 class MixPadHandler(ModeHandlerBase):
 
-    CC_PAD_START_A          = 8
-    CC_PAD_START_B          = 16
-    CC_PAD_END_A            = 15
-    CC_PAD_END_B            = 23
+    CC_PAD_START_A   = 8
+    CC_PAD_START_B   = 16
+    CC_PAD_END_A     = 15
+    CC_PAD_END_B     = 23
 
-    CC_PAD_VOLUME_A         = 8
-    CC_PAD_VOLUME_B         = 16
-    CC_PAD_PAN_A            = 9
-    CC_PAD_PAN_B            = 17
-    CC_PAD_MUTE_A           = 10
-    CC_PAD_MUTE_B           = 18
-    CC_PAD_SOLO_A           = 11
-    CC_PAD_SOLO_B           = 19
+    CC_PAD_VOLUME_A  = 8
+    CC_PAD_VOLUME_B  = 16
+    CC_PAD_PAN_A     = 9
+    CC_PAD_PAN_B     = 17
+    CC_PAD_MUTE_A    = 10
+    CC_PAD_MUTE_B    = 18
+    CC_PAD_SOLO_A    = 11
+    CC_PAD_SOLO_B    = 19
 
     def __init__(self, state_manager, idev_out):
         super().__init__(state_manager)
         self._idev_out = idev_out
         self._knobs_function = FN_VOLUME
+        self._pads_action = None
+        self._pressed_pads = {}
         self._chains_bank = 0
 
     def set_active(self, active):
@@ -300,51 +309,57 @@ class MixPadHandler(ModeHandlerBase):
         if active:
             self._upload_mode_layout_to_device()
 
-    def note_on(self, note, velocity):
-        print(f"MIXPAD note on {note}, {velocity}")
-
-    def note_off(self, note):
-        print(f"MIXPAD note off {note}")
-
     def cc_change(self, ccnum, ccval):
         print(f"MIXPAD cc change {ccnum}, {ccval}")
         # Is a PAD press
         if self.CC_PAD_START_A <= ccnum <= self.CC_PAD_END_B:
-            if ccval == 0:
+
+            # This will happend when FULL LEVEL is on (or with a very strong press)
+            if ccval == 127:
+                if self._current_screen in ["audio_mixer", "zynpad"]:
+                    self._pads_action = FN_SELECT
+                    return self._change_chain(ccnum - self.CC_PAD_START_A, ccval)
+            elif ccval == 0:
+                if self._pads_action != None:
+                    self._pads_action = None
+                    return
                 self._chains_bank = 0
             elif self.CC_PAD_START_B <= ccnum <= self.CC_PAD_END_B:
                 self._chains_bank = 1
 
-            if ccnum in (self.CC_PAD_VOLUME_A, self.CC_PAD_VOLUME_B):
-                self._knobs_function = FN_VOLUME
-            elif ccnum in (self.CC_PAD_PAN_A, self.CC_PAD_PAN_B):
-                self._knobs_function = FN_PAN
-            elif ccnum in (self.CC_PAD_MUTE_A, self.CC_PAD_MUTE_B):
-                self._knobs_function = FN_MUTE
-            elif ccnum in (self.CC_PAD_SOLO_A, self.CC_PAD_SOLO_B):
-                self._knobs_function = FN_SOLO
+            if self._current_screen in ["audio_mixer", "zynpad"]:
+                if ccnum in (self.CC_PAD_VOLUME_A, self.CC_PAD_VOLUME_B):
+                    self._knobs_function = FN_VOLUME
+                elif ccnum in (self.CC_PAD_PAN_A, self.CC_PAD_PAN_B):
+                    self._knobs_function = FN_PAN
+                elif ccnum in (self.CC_PAD_MUTE_A, self.CC_PAD_MUTE_B):
+                    self._knobs_function = FN_MUTE
+                elif ccnum in (self.CC_PAD_SOLO_A, self.CC_PAD_SOLO_B):
+                    self._knobs_function = FN_SOLO
 
         # Is a Knob rotation
         else:
-            if self._knobs_function == FN_VOLUME:
-                self._update_volume(ccnum, ccval)
-            elif self._knobs_function == FN_PAN:
-                self._update_pan(ccnum, ccval)
-            elif self._knobs_function == FN_MUTE:
-                self._update_mute(ccnum, ccval)
-            elif self._knobs_function == FN_SOLO:
-                self._update_solo(ccnum, ccval)
+            if self._current_screen in ["audio_mixer", "zynpad"]:
+                if self._knobs_function == FN_VOLUME:
+                    self._update_volume(ccnum, ccval)
+                elif self._knobs_function == FN_PAN:
+                    self._update_pan(ccnum, ccval)
+                elif self._knobs_function == FN_MUTE:
+                    self._update_mute(ccnum, ccval)
+                elif self._knobs_function == FN_SOLO:
+                    self._update_solo(ccnum, ccval)
 
     def _upload_mode_layout_to_device(self):
         cmd = SysExSetProgram(
             name = "Zynthian MIXPAD",
             channels = {
                 "pads":  DEFAULT_PADS_CH,
+                "keybed": DEFAULT_KEYBED_CH,
             },
             pads = {
                 "note": range(16),
                 "pc": range(16),
-                "cc": range(8, 24),
+                "cc": range(self.CC_PAD_START_A, self.CC_PAD_END_B + 1),
             },
             knobs = {
                 "mode": [KNOB_MODE_REL] * 8,
@@ -359,24 +374,27 @@ class MixPadHandler(ModeHandlerBase):
         lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))
         print("UPLOAD layout: Zynthian MIXPAD")
 
+    def _change_chain(self, ccnum, ccval):
+        return self._update_chain("select", ccnum, ccval)
+
     # FIXME: candidate to DRY
     def _update_volume(self, ccnum, ccval):
-        return self._update_control("level", ccnum, ccval, 0, 100)
+        return self._update_chain("level", ccnum, ccval, 0, 100)
 
     # FIXME: candidate to DRY
     def _update_pan(self, ccnum, ccval):
-        return self._update_control("balance", ccnum, ccval, -100, 100)
+        return self._update_chain("balance", ccnum, ccval, -100, 100)
 
     # FIXME: candidate to DRY
     def _update_mute(self, ccnum, ccval):
-        return self._update_control("mute", ccnum, ccval)
+        return self._update_chain("mute", ccnum, ccval)
 
     # FIXME: candidate to DRY
     def _update_solo(self, ccnum, ccval):
-        return self._update_control("solo", ccnum, ccval)
+        return self._update_chain("solo", ccnum, ccval)
 
     # FIXME: candidate to DRY
-    def _update_control(self, type, ccnum, ccval, minv=None, maxv=None):
+    def _update_chain(self, type, ccnum, ccval, minv=None, maxv=None):
         index = ccnum + self._chains_bank * 8
         chain = self._chain_manager.get_chain_by_index(index)
         if chain is None or chain.chain_id == 0:
@@ -395,6 +413,8 @@ class MixPadHandler(ModeHandlerBase):
         elif type == "solo":
             value = ccval < 64
             set_value = lambda c, v: self._zynmixer.set_solo(c, v, True)
+        elif type == "select":
+            return self._chain_manager.set_active_chain_by_id(chain.chain_id)
         else:
             return False
 
@@ -423,12 +443,13 @@ class DeviceHandler(ModeHandlerBase):
             self._upload_mode_layout_to_device()
 
     def _upload_mode_layout_to_device(self):
+        print("UPLOAD layout: Zynthian DEVICE")
         cmd = SysExSetProgram(
             name = "Zynthian DEVICE",
             pads = {
                 "note": range(16),
                 "pc": range(16),
-                "cc": range(16),
+                "cc": range(8, 24),
             },
             knobs = {
                 "mode": [KNOB_MODE_REL] * 8,
@@ -441,7 +462,6 @@ class DeviceHandler(ModeHandlerBase):
 
         msg = bytes.fromhex("F0 {} F7".format(cmd))
         lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))
-        print("UPLOAD layout: Zynthian DEVICE")
 
 
 # --------------------------------------------------------------------------
@@ -458,12 +478,13 @@ class PatternHandler(ModeHandlerBase):
             self._upload_mode_layout_to_device()
 
     def _upload_mode_layout_to_device(self):
+        print("UPLOAD layout: Zynthian PATTERN")
         cmd = SysExSetProgram(
             name = "Zynthian PATTERN",
             pads = {
                 "note": range(16),
                 "pc": range(16),
-                "cc": range(16),
+                "cc": range(8, 24),
             },
             knobs = {
                 "mode": [KNOB_MODE_REL] * 8,
@@ -479,4 +500,101 @@ class PatternHandler(ModeHandlerBase):
 
         msg = bytes.fromhex("F0 {} F7".format(cmd))
         lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))
-        print("UPLOAD layout: Zynthian PATTERN")
+
+
+# --------------------------------------------------------------------------
+# Handle an editor of note pads (NotePad mode)
+# --------------------------------------------------------------------------
+class NotePadHandler(ModeHandlerBase):
+
+    CC_KNOB_CHANNEL   = 0
+    CC_PAD_CHANNEL    = 8
+
+    def __init__(self, state_manager, idev_out):
+        super().__init__(state_manager)
+        self._idev_out = idev_out
+        self._channel = DEFAULT_PADS_CH
+        self._channel_to_commit = None
+        self._notes = list(range(16))
+        self._notes_to_commit = {}
+        self._pressed_pads = {}
+
+    def set_active(self, active):
+        super().set_active(active)
+        if active:
+            self._upload_mode_layout_to_device()
+
+    def note_on(self, note, channel, velocity):
+        print(f"NOTEPAD note on, note: {note}, ch: {channel}, vel: {velocity}")
+        if channel == self._channel:
+            try:
+                pad = self._notes.index(note)
+                self._pressed_pads[pad] = time.time()
+                print(f" -- add pressed pad: {pad}")
+            except ValueError:
+                pass
+
+        # NOTE: Keybed channel and pad channel may be the same
+        if channel == DEFAULT_KEYBED_CH:
+            if len(self._pressed_pads) == 1:
+                pad = next(iter(self._pressed_pads))
+                if note not in self._notes:
+                    print(f" -- ASIGN note {note} to pad {pad}")
+                    self._notes_to_commit[pad] = note
+
+    def note_off(self, note, channel):
+        print(f"NOTEPAD note off, note: {note}, ch: {channel}")
+        if channel == self._channel:
+            try:
+                pad = self._notes.index(note)
+                self._pressed_pads.pop(pad, None)
+                print(f" -- remove pressed pad: {pad}")
+            except ValueError:
+                pass
+
+        if len(self._pressed_pads) == 0:
+            if self._notes_to_commit:
+                while self._notes_to_commit:
+                    pad, note = self._notes_to_commit.popitem()
+                    self._notes[pad] = note
+                self._upload_mode_layout_to_device()
+
+    def cc_change(self, ccnum, ccval):
+        print(f"NOTEPAD cc change {ccnum}, {ccval}")
+        if ccnum == self.CC_PAD_CHANNEL:
+            if ccval > 0:
+                self._pressed_pads[ccnum - 8] = time.time()
+            else:
+                if self._channel_to_commit is not None:
+                    self._channel = self._channel_to_commit
+                    self._channel_to_commit = None
+                    self._upload_mode_layout_to_device()
+
+        elif ccnum == self.CC_KNOB_CHANNEL:
+            if self._pressed_pads and (self.CC_PAD_CHANNEL - 8) in self._pressed_pads:
+                self._channel_to_commit = ccval - 1
+
+    def _upload_mode_layout_to_device(self):
+        print("UPLOAD layout: Zynthian NOTEPAD")
+        cmd = SysExSetProgram(
+            name = "Zynthian NOTEPAD",
+            channels = {
+                "pads":  self._channel,
+                "keybed": DEFAULT_KEYBED_CH,
+            },
+            pads = {
+                "note": self._notes,
+                "pc": range(16),
+                "cc": range(8, 24),
+            },
+            knobs = {
+                "mode": [KNOB_MODE_ABS] + [KNOB_MODE_REL] * 7,
+                "cc": range(8),
+                "min": [1] + [0] * 7,
+                "max": [16] + [127] * 7,
+                "name": ["Channel"] + [f"K{i}" for i in range(2, 9)],
+            }
+        )
+
+        msg = bytes.fromhex("F0 {} F7".format(cmd))
+        lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))

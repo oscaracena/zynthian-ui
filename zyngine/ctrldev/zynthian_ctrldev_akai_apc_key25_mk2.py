@@ -2240,8 +2240,7 @@ class StepSeqHandler(ModeHandlerBase):
         self._on_shifted_override(shifted_override)
 
         if BTN_PAD_START <= note <= BTN_PAD_END:
-            if note in self._pressed_pads:
-                self._pressed_pads.pop(note, None)
+            self._pressed_pads.pop(note, None)
 
             if self._note_config is not None:
                 self._pressed_pads_action = "note-config"
