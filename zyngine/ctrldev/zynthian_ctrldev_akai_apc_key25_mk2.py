@@ -220,7 +220,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         #!FIXME: just for developing, remove!
         from pathlib import Path
         import json
-        saved = Path("/root/step-seq-save-test.json")
+        saved = Path("/root/apc-key25-mk2-save.json")
         if saved.exists():
             self.set_state(json.load(saved.open()))
 
@@ -232,7 +232,7 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         #!FIXME: just for developing, remove!
         from pathlib import Path
         import json
-        with Path("/root/step-seq-save-test.json").open("w") as dst:
+        with Path("/root/apc-key25-mk2-save.json").open("w") as dst:
             json.dump(self.get_state(), dst, indent=4)
 
     def refresh(self):
@@ -367,16 +367,10 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
 
     def get_state(self):
         state = {}
-        state.update(self._device_handler.get_state())
-        state.update(self._mixer_handler.get_state())
-        state.update(self._padmatrix_handler.get_state())
         state.update(self._stepseq_handler.get_state())
         return state
 
     def set_state(self, state):
-        self._device_handler.set_state(state)
-        self._mixer_handler.set_state(state)
-        self._padmatrix_handler.set_state(state)
         self._stepseq_handler.set_state(state)
 
     def _on_shift_changed(self, state):
