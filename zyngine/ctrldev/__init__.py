@@ -10,4 +10,5 @@ __all__ = [
     "zynthian_ctrldev_riband",
     "zynthian_ctrldev_akai_apc_key25_mk2",
     "zynthian_ctrldev_duopiano",
+    "zynthian_ctrldev_akai_mpk_mini_mk3",
 ]
