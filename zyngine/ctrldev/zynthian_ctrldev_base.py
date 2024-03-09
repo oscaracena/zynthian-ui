@@ -213,9 +213,11 @@ class zynthian_ctrldev_zynmixer(zynthian_ctrldev_base):
 
 
 # --------------------------------------------------------------------------
-# A timer for running delayed actions (mostly used for feedback LEDs)
+# A timer for running delayed actions
 # --------------------------------------------------------------------------
 class RunTimer(Thread):
+    RESOLUTION = 0.1
+
     def __init__(self):
         super().__init__()
         self._lock = RLock()
@@ -224,6 +226,9 @@ class RunTimer(Thread):
 
         self.daemon = True
         self.start()
+
+    def __contains__(self, b):
+        return b in self._actions
 
     def add(self, name, timeout, callback, *args, **kwargs):
         with self._lock:
@@ -248,8 +253,8 @@ class RunTimer(Thread):
             self._awake.clear()
             for action in self._get_expired():
                 self._run_action(*action[1:])
-            time.sleep(0.1)
-            self._update_timeouts(-0.1)
+            time.sleep(self.RESOLUTION)
+            self._update_timeouts(-self.RESOLUTION)
 
     def _update_timeouts(self, delta):
         delta *= 1000
@@ -275,6 +280,72 @@ class RunTimer(Thread):
             callback(name, *args, **kwargs)
         except Exception as ex:
             print(f" error in handler: {ex}")
+
+
+# --------------------------------------------------------------------------
+#  A timer for running repeated actions
+# --------------------------------------------------------------------------
+class IntervalTimer(RunTimer):
+    RESOLUTION = 0.05
+
+    def add(self, name, timeout, callback, *args, **kwargs):
+        with self._lock:
+            self._actions[name] = [timeout, timeout, callback, name, args, kwargs]
+        self._awake.set()
+
+    def update(self, name, timeout):
+        with self._lock:
+            action = self._actions.get(name)
+            if action is None:
+                return
+            action[1] = timeout
+
+    def run(self):
+        while True:
+            if not self._actions:
+                self._awake.wait()
+            self._awake.clear()
+            for action in self._get_expired():
+                self._run_action(*action[2:])
+            time.sleep(self.RESOLUTION)
+            self._update_timeouts(self.RESOLUTION)
+
+    def _get_expired(self):
+        retval = []
+        with self._lock:
+            for spec in self._actions.values():
+                if spec[0] < spec[1]:
+                    continue
+                retval.append(spec)
+                spec[0] = 0
+
+        return retval
+
+
+# --------------------------------------------------------------------------
+#  Helper class to handle knobs speed
+# --------------------------------------------------------------------------
+class KnobSpeedControl:
+    def __init__(self, steps_normal=3, steps_shifted=8):
+        self._steps_normal = steps_normal
+        self._steps_shifted = steps_shifted
+        self._knobs_ease = {}
+
+    def feed(self, ccnum, ccval, is_shifted=False):
+        delta = ccval if ccval < 64 else (ccval - 128)
+        count = self._knobs_ease.get(ccnum, 0)
+        steps = self._steps_shifted if is_shifted else self._steps_normal
+
+        if (delta < 0 and count > 0) or (delta > 0 and count < 0):
+            count = 0
+        count += delta
+
+        if abs(count) < steps:
+            self._knobs_ease[ccnum] = count
+            return
+
+        self._knobs_ease[ccnum] = 0
+        return delta
 
 
 # --------------------------------------------------------------------------

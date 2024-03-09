@@ -34,10 +34,10 @@ from copy import deepcopy
 from threading import Thread, RLock, Event
 from zyngine.ctrldev.zynthian_ctrldev_base import (
     zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad, RunTimer, ModeHandlerBase,
+    KnobSpeedControl
 )
 from zyngine.zynthian_engine_audioplayer import zynthian_engine_audioplayer
 from zyngine.zynthian_signal_manager import zynsigman
-# from zyngui import zynthian_gui_config
 from zyncoder.zyncore import lib_zyncore
 from zynlibs.zynseq import zynseq
 
@@ -451,71 +451,6 @@ class ButtonTimer(Thread):
             print(f"ERROR in handler: {ex}")
 
 
-# # --------------------------------------------------------------------------
-# # A timer for running delayed actions (mostly used for feedback LEDs)
-# # --------------------------------------------------------------------------
-# class RunTimer(Thread):
-#     def __init__(self):
-#         super().__init__()
-#         self._lock = RLock()
-#         self._awake = Event()
-#         self._actions = {}
-
-#         self.daemon = True
-#         self.start()
-
-#     def add(self, name, timeout, callback, *args, **kwargs):
-#         with self._lock:
-#             self._actions[name] = [timeout, callback, name, args, kwargs]
-#         self._awake.set()
-
-#     def update(self, name, timeout):
-#         with self._lock:
-#             action = self._actions.get(name)
-#             if action is None:
-#                 return
-#             action[0] = timeout
-
-#     def remove(self, name):
-#         with self._lock:
-#             self._actions.pop(name, None)
-
-#     def run(self):
-#         while True:
-#             if not self._actions:
-#                 self._awake.wait()
-#             self._awake.clear()
-#             for action in self._get_expired():
-#                 self._run_action(*action[1:])
-#             time.sleep(0.1)
-#             self._update_timeouts(-0.1)
-
-#     def _update_timeouts(self, delta):
-#         delta *= 1000
-#         with self._lock:
-#             for action in self._actions.values():
-#                 action[0] += delta
-
-#     def _get_expired(self):
-#         retval = []
-#         with self._lock:
-#             to_remove = []
-#             for name, spec in self._actions.items():
-#                 if spec[0] > 0:
-#                     continue
-#                 to_remove.append(name)
-#                 retval.append(spec)
-#             for name in to_remove:
-#                 self._actions.pop(name, None)
-#         return retval
-
-#     def _run_action(self, callback, name, args, kwargs):
-#         try:
-#             callback(name, *args, **kwargs)
-#         except Exception as ex:
-#             print(f" error in handler: {ex}")
-
-
 # --------------------------------------------------------------------------
 # Feedback LEDs controller
 # --------------------------------------------------------------------------
@@ -580,221 +515,6 @@ class FeedbackLEDs:
 
 
 # --------------------------------------------------------------------------
-#  Helper class to handle knobs speed (mostly to reduce it)
-# --------------------------------------------------------------------------
-class KnobSpeedControl:
-    def __init__(self, steps_normal=3, steps_shifted=8):
-        self._steps_normal = steps_normal
-        self._steps_shifted = steps_shifted
-        self._knobs_ease = {}
-
-    def feed(self, ccnum, ccval, is_shifted=False):
-        delta = ccval if ccval < 64 else (ccval - 128)
-        count = self._knobs_ease.get(ccnum, 0)
-        steps = self._steps_shifted if is_shifted else self._steps_normal
-
-        if (delta < 0 and count > 0) or (delta > 0 and count < 0):
-            count = 0
-        count += delta
-
-        if abs(count) < steps:
-            self._knobs_ease[ccnum] = count
-            return
-
-        self._knobs_ease[ccnum] = 0
-        return delta
-
-
-# # --------------------------------------------------------------------------
-# #  Base class for mode handlers
-# # --------------------------------------------------------------------------
-# class ModeHandlerBase:
-
-#     SCREEN_CUIA_MAP = {
-#         "option":         "MENU",
-#         "main_menu":      "MENU",
-#         "admin":          "SCREEN_ADMIN",
-#         "audio_mixer":    "SCREEN_AUDIO_MIXER",
-#         "alsa_mixer":     "SCREEN_ALSA_MIXER",
-#         "control":        "SCREEN_CONTROL",
-#         "preset":         "PRESET",
-#         "zs3":            "SCREEN_ZS3",
-#         "snapshot":       "SCREEN_SNAPSHOT",
-#         "zynpad":         "SCREEN_ZYNPAD",
-#         "pattern_editor": "SCREEN_PATTERN_EDITOR",
-#         "tempo":          "TEMPO",
-#     }
-
-#     # These are actions requested to other handlers (shared between everyone)
-#     _pending_actions = []
-
-#     def __init__(self, state_manager):
-#         self._state_manager = state_manager
-#         self._chain_manager = state_manager.chain_manager
-#         self._zynmixer = state_manager.zynmixer
-#         self._zynseq = state_manager.zynseq
-
-#         self._timer = None
-#         self._current_screen = None
-#         self._is_shifted = False
-#         self._is_active = False
-
-#     def refresh(self):
-#         pass
-
-#     def set_active(self, active):
-#         self._is_active = active
-
-#     def note_on(self, note, velocity, shifted_override=None):
-#         pass
-
-#     def note_off(self, note, shifted_override=None):
-#         pass
-
-#     def cc_change(self, ccnum, ccval):
-#         pass
-
-#     def get_state(self):
-#         return {}
-
-#     def set_state(self, state):
-#         pass
-
-#     def on_media_change(self, media, kind, state):
-#         pass
-
-#     def on_shift_changed(self, state):
-#         self._is_shifted = state
-#         return True
-
-#     def on_screen_change(self, screen):
-#         self._current_screen = screen
-
-#     def pop_action_request(self):
-#         if not self._pending_actions:
-#             return None
-#         return self._pending_actions.pop(0)
-
-#     def run_action(self, action, args, kwargs):
-#         action = "_action_" + action.replace("-", "_")
-#         action = getattr(self, action, None)
-#         if callable(action):
-#             try:
-#                 action(*args, **kwargs)
-#             except Exception as ex:
-#                 print(f" error in handler: {ex}")
-
-#     def _request_action(self, receiver, action, *args, **kwargs):
-#         self._pending_actions.append((receiver, action, args, kwargs))
-
-#     def _stop_all_sounds(self):
-#         self._state_manager.send_cuia("ALL_SOUNDS_OFF")
-#         self._state_manager.stop_midi_playback()
-#         self._state_manager.stop_audio_player()
-
-#     def _on_shifted_override(self, override=None):
-#         if override is not None:
-#             self._is_shifted = override
-
-#     # FIXME: Could this be in chain_manager?
-#     def _get_chain_id_by_sequence(self, bank, seq):
-#         channel = self._libseq.getChannel(bank, seq, 0)
-#         return next(
-#             (id for id, c in self._chain_manager.chains.items()
-#                 if c.midi_chan == channel),
-#             None
-#         )
-
-#     # FIXME: Could this (or part of this) be in zynseq?
-#     def _get_sequence_patterns(self, bank, seq, create=False):
-#         seq_len = self._libseq.getSequenceLength(bank, seq)
-#         pattern = -1
-#         retval = []
-
-#         if seq_len == 0:
-#             if create:
-#                 pattern = self._libseq.createPattern()
-#                 self._libseq.addPattern(bank, seq, 0, 0, pattern)
-#                 retval.append(pattern)
-#             return retval
-
-#         n_tracks = self._libseq.getTracksInSequence(bank, seq)
-#         for track in range(n_tracks):
-#             retval.extend(self._get_patterns_in_track(bank, seq, track))
-#         return retval
-
-#     # FIXME: Could this be in zynseq?
-#     def _get_patterns_in_track(self, bank, seq, track):
-#         retval = []
-#         n_patts = self._libseq.getPatternsInTrack(bank, seq, track)
-#         if n_patts == 0:
-#             return retval
-
-#         seq_len = self._libseq.getSequenceLength(bank, seq)
-#         pos = 0
-#         while pos < seq_len:
-#             pattern = self._libseq.getPatternAt(bank, seq, track, pos)
-#             if pattern != -1:
-#                 retval.append(pattern)
-#                 pos += self._libseq.getPatternLength(pattern)
-#             else:
-#                 # Arranger's offset step is a quarter note (24 clocks)
-#                 pos += 24
-#         return retval
-
-#     # FIXME: Could this be in zynseq?
-#     def _set_note_duration(self, step, note, duration):
-#         velocity = self._libseq.getNoteVelocity(step, note)
-#         stutt_count = self._libseq.getStutterCount(step, note)
-#         stutt_duration = self._libseq.getStutterDur(step, note)
-#         self._libseq.removeNote(step, note)
-#         self._libseq.addNote(step, note, velocity, duration)
-#         self._libseq.setStutterCount(step, note, stutt_count)
-#         self._libseq.setStutterDur(step, note, stutt_duration)
-
-#     # FIXME: This way avoids to show Zynpad every time, BUT is coupled to UI!
-#     def _show_pattern_editor(self, seq):
-#         if self._current_screen != 'pattern_editor':
-#             self._state_manager.send_cuia("SCREEN_ZYNPAD")
-#         self._select_pad(seq)
-#         zynthian_gui_config.zyngui.screens["zynpad"].show_pattern_editor()
-
-#     # FIXME: This SHOULD be a CUIA, not this hack! (is coupled with UI)
-#     def _select_pad(self, pad):
-#         zynthian_gui_config.zyngui.screens["zynpad"].select_pad(pad)
-
-#     # FIXME: This SHOULD be a CUIA, not this hack! (is coupled with UI)
-#     # NOTE: It runs in a thread to avoid lagging the hardware interface
-#     def _update_ui_arranger(self, cell_selected=(None, None)):
-#         def run():
-#             arranger = zynthian_gui_config.zyngui.screens["arranger"]
-#             arranger.select_cell(*cell_selected)
-#             if cell_selected[1] is not None:
-#                 arranger.draw_row(cell_selected[1])
-#         Thread(target=run, daemon=True).start()
-
-#     def _show_screen_briefly(self, screen, cuia, timeout):
-#         # Only created when/if needed
-#         if self._timer is None:
-#             self._timer = RunTimer()
-
-#         timer_name = "change-screen"
-#         prev_screen = "BACK"
-
-#         # If brief screen is audio mixer, there is no back, so try to get the screen
-#         # name. Not all screens may be mapped, so it will fail there (only corner-cases).
-#         if screen == "audio_mixer":
-#             prev_screen = self.SCREEN_CUIA_MAP.get(self._current_screen, "BACK")
-
-#         if screen != self._current_screen:
-#             self._state_manager.send_cuia(cuia)
-#             self._timer.add(timer_name, timeout,
-#                 lambda _: self._state_manager.send_cuia(prev_screen))
-#         else:
-#             self._timer.update(timer_name, timeout)
-
-
-# --------------------------------------------------------------------------
 # Handle GUI (device mode)
 # --------------------------------------------------------------------------
 class DeviceHandler(ModeHandlerBase):
@@ -810,7 +530,7 @@ class DeviceHandler(ModeHandlerBase):
         self._btn_actions = {
             BTN_OPT_ADMIN:      ("MENU", "SCREEN_ADMIN"),
             BTN_MIX_LEVEL:      ("SCREEN_AUDIO_MIXER", "SCREEN_ALSA_MIXER"),
-            BTN_CTRL_PRESET:    ("SCREEN_CONTROL", "PRESET"),
+            BTN_CTRL_PRESET:    ("SCREEN_CONTROL", "PRESET", "SCREEN_BANK"),
             BTN_ZS3_SHOT:       ("SCREEN_ZS3", "SCREEN_SNAPSHOT"),
             BTN_PAD_STEP:       ("SCREEN_ZYNPAD", "SCREEN_PATTERN_EDITOR"),
             BTN_METRONOME:      ("TEMPO",),
