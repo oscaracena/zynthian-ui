@@ -34,7 +34,7 @@ from copy import deepcopy
 from threading import Thread, RLock, Event
 from zyngine.ctrldev.zynthian_ctrldev_base import (
     zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad, RunTimer, ModeHandlerBase,
-    KnobSpeedControl
+    KnobSpeedControl, ButtonTimer, CONST
 )
 from zyngine.zynthian_engine_audioplayer import zynthian_engine_audioplayer
 from zyngine.zynthian_signal_manager import zynsigman
@@ -162,12 +162,6 @@ FN_REMOVE_NOTE                       = 0x0D
 FN_REMOVE_PATTERN                    = 0x0F
 FN_SELECT_PATTERN                    = 0x10
 FN_CLEAR_PATTERN                     = 0x11
-
-PT_SHORT                             = "short"
-PT_BOLD                              = "bold"
-PT_LONG                              = "long"
-PT_BOLD_TIME                         = 0.3
-PT_LONG_TIME                         = 2.0
 
 
 # --------------------------------------------------------------------------
@@ -394,64 +388,6 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
 
 
 # --------------------------------------------------------------------------
-# A handy timer for triggering short/bold/long push actions
-# --------------------------------------------------------------------------
-class ButtonTimer(Thread):
-    def __init__(self, callback):
-        super().__init__()
-        self._callback = callback
-        self._lock = RLock()
-        self._awake = Event()
-        self._pressed = {}
-
-        self.daemon = True
-        self.start()
-
-    def is_pressed(self, btn, ts):
-        with self._lock:
-            self._pressed[btn] = ts
-        self._awake.set()
-
-    def is_released(self, btn):
-        with self._lock:
-            ts = self._pressed.pop(btn, None)
-        if ts is not None:
-            elapsed = time.time() - ts
-            self._run_callback(btn, elapsed)
-
-    def run(self):
-        while True:
-            with self._lock:
-                expired, elapsed = self._get_expired()
-            if expired is not None:
-                self._run_callback(expired, elapsed)
-
-            time.sleep(0.1)
-            if not self._pressed:
-                self._awake.wait()
-            self._awake.clear()
-
-    def _get_expired(self):
-        now = time.time()
-        retval = None
-        for btn, ts in self._pressed.items():
-            elapsed = now - ts
-            if elapsed > PT_LONG_TIME:
-                retval = btn
-                break
-        if retval:
-            self._pressed.pop(btn, None)
-        return retval, elapsed if retval else 0
-
-    def _run_callback(self, note, elapsed):
-        ptype = [PT_SHORT, PT_BOLD, PT_LONG][bisect([PT_BOLD_TIME, PT_LONG_TIME], elapsed)]
-        try:
-            self._callback(note, ptype)
-        except Exception as ex:
-            print(f"ERROR in handler: {ex}")
-
-
-# --------------------------------------------------------------------------
 # Feedback LEDs controller
 # --------------------------------------------------------------------------
 class FeedbackLEDs:
@@ -670,7 +606,7 @@ class DeviceHandler(ModeHandlerBase):
         flags.add(media) if state else flags.discard(media)
 
     def _handle_timed_button(self, btn, press_type):
-        if press_type == PT_LONG:
+        if press_type == CONST.PT_LONG:
             cuia = {
                 BTN_OPT_ADMIN:   "POWER_OFF",
                 BTN_CTRL_PRESET: "PRESET_FAV",
@@ -684,14 +620,14 @@ class DeviceHandler(ModeHandlerBase):
         if actions is None:
             return
         if callable(actions):
-            actions = actions(press_type == PT_BOLD)
+            actions = actions(press_type == CONST.PT_BOLD)
 
         idx = -1
-        if press_type == PT_SHORT:
+        if press_type == CONST.PT_SHORT:
             idx = self._btn_states[btn]
             idx = (idx + 1) % len(actions)
             cuia = actions[idx]
-        elif press_type == PT_BOLD:
+        elif press_type == CONST.PT_BOLD:
             # In buttons with 2 functions, the default on bold press is the second
             idx = 1 if len(actions) > 1 else 0
             cuia = actions[idx]
@@ -1166,10 +1102,10 @@ class PadMatrixHandler(ModeHandlerBase):
 
     def _handle_timed_button(self, btn, ptype):
         if btn == BTN_STOP_ALL_CLIPS:
-            if ptype == PT_LONG:
+            if ptype == CONST.PT_LONG:
                 self._stop_all_sounds()
             else:
-                in_all_banks = ptype == PT_BOLD
+                in_all_banks = ptype == CONST.PT_BOLD
                 self._stop_all_seqs(in_all_banks)
 
     def _seqman_handle_pad_press(self, seq):
