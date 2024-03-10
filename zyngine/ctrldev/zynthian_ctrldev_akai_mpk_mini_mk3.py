@@ -114,6 +114,7 @@ PROG_MIXPAD_MODE            = 4
 PROG_DEVICE_MODE            = 5
 PROG_PATTERN_MODE           = 6
 PROG_NOTEPAD_MODE           = 7
+PROG_USER_MODE              = 12
 PROG_OPEN_MIXER             = 0
 PROG_OPEN_ZYNPAD            = 1
 PROG_OPEN_TEMPO             = 2
@@ -261,6 +262,7 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
         self._device_handler = DeviceHandler(state_manager, idev_out, self._saved_state)
         self._pattern_handler = PatternHandler(state_manager, idev_out, self._saved_state)
         self._notepad_handler = NotePadHandler(state_manager, idev_out, self._saved_state)
+        self._user_handler = UserHandler(state_manager, idev_out, self._saved_state)
         self._current_handler = self._mixpad_handler
         self._current_screen = None
 
@@ -320,6 +322,8 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
                 self._change_handler(self._pattern_handler)
             elif program == PROG_NOTEPAD_MODE:
                 self._change_handler(self._notepad_handler)
+            elif program == PROG_USER_MODE:
+                self._change_handler(self._user_handler)
             elif program == PROG_OPEN_MIXER:
                 self.state_manager.send_cuia("SCREEN_AUDIO_MIXER")
             elif program == PROG_OPEN_ZYNPAD:
@@ -927,6 +931,56 @@ class NotePadHandler(ModeHandlerBase):
                 "y-neg-ch": self.CC_JOY_Y_NEG,
                 "y-pos-ch": self.CC_JOY_Y_POS,
             }
+        )
+
+        msg = bytes.fromhex("F0 {} F7".format(cmd))
+        lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))
+
+
+# --------------------------------------------------------------------------
+# Empty handler to allow the use of PADs/KNOBs for MIDI learn (User mode)
+# --------------------------------------------------------------------------
+class UserHandler(ModeHandlerBase):
+
+    CC_JOY_X_NEG = 32
+    CC_JOY_X_POS = 33
+
+    def __init__(self, state_manager, idev_out, saved_state: SavedState):
+        super().__init__(state_manager)
+        self._idev_out = idev_out
+        self._saved_state = saved_state
+
+    def set_active(self, active):
+        super().set_active(active)
+        if active:
+            self._upload_mode_layout_to_device()
+
+    def _upload_mode_layout_to_device(self):
+        print("UPLOAD layout: Zynthian USER")
+        cmd = SysExSetProgram(
+            name = "Zynthian USER",
+            tempo = self._saved_state.tempo,
+            channels = {
+                "pads": self._saved_state.pads_channel,
+            },
+            pads = {
+                "note": self._saved_state.pad_notes,
+                "pc": range(16),
+                "cc": range(8, 24),
+            },
+            knobs = {
+                "mode": [KNOB_MODE_ABS] * 8,
+                "cc": range(24, 32),
+                "min": [0] * 8,
+                "max": [127] * 8,
+                "name": [f"K{i}" for i in range(1, 9)],
+            },
+            joy = {
+                "x-mode": JOY_MODE_DUAL,
+                "x-neg-ch": self.CC_JOY_X_NEG,
+                "x-pos-ch": self.CC_JOY_X_POS,
+                "y-mode": JOY_MODE_PITCHBEND,
+            },
         )
 
         msg = bytes.fromhex("F0 {} F7".format(cmd))
