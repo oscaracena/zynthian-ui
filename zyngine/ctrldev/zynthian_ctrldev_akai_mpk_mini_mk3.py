@@ -91,8 +91,8 @@ ARP_SWING_MAX               = 0x19
 # Clock settings
 CLK_INTERNAL                = 0x00
 CLK_EXTERNAL                = 0x01
-TEMPO_TAPS_MIN              = 2
-TEMPO_TAPS_MAX              = 4
+TEMPO_TAPS_MIN              = 0x02
+TEMPO_TAPS_MAX              = 0x04
 BPM_MIN                     = 60
 BPM_MAX                     = 240
 
@@ -102,23 +102,23 @@ JOY_MODE_SINGLE             = 0x01
 JOY_MODE_DUAL               = 0x02
 
 # Knobs
-KNOB_MODE_ABS               = 0
-KNOB_MODE_REL               = 1
+KNOB_MODE_ABS               = 0x00
+KNOB_MODE_REL               = 0x01
 
 # Device Layout constants
-DEFAULT_KEYBED_CH           = 0
-DEFAULT_PADS_CH             = 9
+DEFAULT_KEYBED_CH           = 0x00
+DEFAULT_PADS_CH             = 0x09
 
 # PC numbers for related actions
-PROG_MIXPAD_MODE            = 4
-PROG_DEVICE_MODE            = 5
-PROG_PATTERN_MODE           = 6
-PROG_NOTEPAD_MODE           = 7
-PROG_USER_MODE              = 12
-PROG_OPEN_MIXER             = 0
-PROG_OPEN_ZYNPAD            = 1
-PROG_OPEN_TEMPO             = 2
-PROG_OPEN_SNAPSHOT          = 3
+PROG_MIXPAD_MODE            = 0x04
+PROG_DEVICE_MODE            = 0x05
+PROG_PATTERN_MODE           = 0x06
+PROG_NOTEPAD_MODE           = 0x07
+PROG_USER_MODE              = 0x0c
+PROG_OPEN_MIXER             = 0x00
+PROG_OPEN_ZYNPAD            = 0x01
+PROG_OPEN_TEMPO             = 0x02
+PROG_OPEN_SNAPSHOT          = 0x03
 
 # Function/State constants
 FN_VOLUME                   = 0x01
@@ -280,32 +280,34 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
 
-        #!FIXME: just for developing, remove when set_state/get_state hooks are ready!
-        from pathlib import Path
-        import json
-        saved = Path("/root/mpk-mini-mk3-save.json")
-        if saved.exists():
-            self.set_state(json.load(saved.open()))
+        # #!FIXME: just for developing, remove when set_state/get_state hooks are ready!
+        # from pathlib import Path
+        # import json
+        # saved = Path("/root/mpk-mini-mk3-save.json")
+        # if saved.exists():
+        #     self.set_state(json.load(saved.open()))
 
-        self._current_handler.set_active(True)
+        # self._current_handler.set_active(True)
 
     def end(self):
         for signal, subsignal, callback in self._signals:
             zynsigman.unregister(signal, subsignal, callback)
         super().end()
 
-        #!FIXME: just for developing, remove when set_state/get_state hooks are ready!
-        from pathlib import Path
-        import json
-        with Path("/root/mpk-mini-mk3-save.json").open("w") as dst:
-            json.dump(self.get_state(), dst, indent=4)
+        # #!FIXME: just for developing, remove when set_state/get_state hooks are ready!
+        # from pathlib import Path
+        # import json
+        # with Path("/root/mpk-mini-mk3-save.json").open("w") as dst:
+        #     json.dump(self.get_state(), dst, indent=4)
 
     def get_state(self):
+        print(f"GET state called!")
         return self._saved_state.save()
 
     def set_state(self, state):
+        print(f"SET state called: {state}")
         self._saved_state.load(state)
-        # FIXME: tempo and other settings may have changed, update device!
+        self._current_handler.set_active(True)
 
     def midi_event(self, ev: int):
         # print(" ".join(f"{b:02X}" for b in ev.to_bytes(3, "big")))
@@ -575,29 +577,29 @@ class MixPadHandler(ModeHandlerBase):
 # --------------------------------------------------------------------------
 class DeviceHandler(ModeHandlerBase):
 
-    CC_PAD_START       = 8
-    CC_PAD_LEFT        = 8
-    CC_PAD_DOWN        = 9
-    CC_PAD_RIGHT       = 10
-    CC_PAD_CTRL_PRESET = 11
-    CC_PAD_BACK_NO     = 12
-    CC_PAD_UP          = 13
-    CC_PAD_SEL_YES     = 14
-    CC_PAD_OPT_ADMIN   = 15
-    CC_PAD_END         = 23
+    CC_PAD_START         = 8
+    CC_PAD_LEFT          = 8
+    CC_PAD_DOWN          = 9
+    CC_PAD_RIGHT         = 10
+    CC_PAD_CTRL_PRESET   = 11
+    CC_PAD_BACK_NO       = 12
+    CC_PAD_UP            = 13
+    CC_PAD_SEL_YES       = 14
+    CC_PAD_OPT_ADMIN     = 15
+    CC_PAD_END           = 23
 
-    CC_KNOB_START      = 24
-    CC_KNOB_LAYER      = 24
-    CC_KNOB_SNAPSHOT   = 25
-    CC_KNOB_TEMPO      = 26
-    CC_KNOB_BACK       = 28
-    CC_KNOB_SELECT     = 29
-    CC_KNOB_END        = 31
+    CC_KNOB_START        = 24
+    CC_KNOB_LAYER        = 24
+    CC_KNOB_SNAPSHOT     = 25
+    CC_KNOB_TEMPO        = 26
+    CC_KNOB_BACK         = 28
+    CC_KNOB_SELECT       = 29
+    CC_KNOB_END          = 31
 
-    CC_JOY_X_NEG       = 32
-    CC_JOY_X_POS       = 33
-    CC_JOY_Y_NEG       = 34
-    CC_JOY_Y_POS       = 35
+    CC_JOY_X_NEG         = 32
+    CC_JOY_X_POS         = 33
+    CC_JOY_Y_NEG         = 34
+    CC_JOY_Y_POS         = 35
 
     def __init__(self, state_manager, idev_out, saved_state: SavedState):
         super().__init__(state_manager)
