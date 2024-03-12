@@ -279,26 +279,12 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
         super().init()
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
-
-        # #!FIXME: just for developing, remove when set_state/get_state hooks are ready!
-        # from pathlib import Path
-        # import json
-        # saved = Path("/root/mpk-mini-mk3-save.json")
-        # if saved.exists():
-        #     self.set_state(json.load(saved.open()))
-
-        # self._current_handler.set_active(True)
+        self._current_handler.set_active(True)
 
     def end(self):
         for signal, subsignal, callback in self._signals:
             zynsigman.unregister(signal, subsignal, callback)
         super().end()
-
-        # #!FIXME: just for developing, remove when set_state/get_state hooks are ready!
-        # from pathlib import Path
-        # import json
-        # with Path("/root/mpk-mini-mk3-save.json").open("w") as dst:
-        #     json.dump(self.get_state(), dst, indent=4)
 
     def get_state(self):
         print(f"GET state called!")
@@ -309,13 +295,12 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
         self._saved_state.load(state)
         self._current_handler.set_active(True)
 
-    def midi_event(self, ev: int):
-        # print(" ".join(f"{b:02X}" for b in ev.to_bytes(3, "big")))
-        evtype = (ev & 0xF00000) >> 20
-        channel = (ev & 0x0F0000) >> 16
+    def midi_event(self, ev: bytes):
+        # print(" ".join(f"{b:02X}" for b in ev))
+        evtype = (ev[0] >> 4) & 0x0F
 
         if evtype == CONST.MIDI_PC:
-            program = (ev >> 8) & 0x7F
+            program = ev[1] & 0x7F
             if program == PROG_MIXPAD_MODE:
                 self._change_handler(self._mixpad_handler)
             elif program == PROG_DEVICE_MODE:
@@ -338,18 +323,23 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
                     "SCREEN_SNAPSHOT" if self._current_screen == "zs3" else "SCREEN_ZS3")
 
         elif evtype == CONST.MIDI_NOTE_ON:
-            note = (ev >> 8) & 0x7F
-            velocity = ev & 0x7F
+            note = ev[1] & 0x7F
+            velocity = ev[2] & 0x7F
+            channel = ev[0] & 0x0F
             self._current_handler.note_on(note, channel, velocity)
 
         elif evtype == CONST.MIDI_NOTE_OFF:
-            note = (ev >> 8) & 0x7F
+            note = ev[1] & 0x7F
+            channel = ev[0] & 0x0F
             self._current_handler.note_off(note, channel)
 
         elif evtype == CONST.MIDI_CC:
-            ccnum = (ev >> 8) & 0x7F
-            ccval = ev & 0x7F
+            ccnum = ev[1] & 0x7F
+            ccval = ev[2] & 0x7F
             self._current_handler.cc_change(ccnum, ccval)
+
+        elif ev[0] == CONST.MIDI_SYSEX:
+            self._current_handler.sysex_message(ev[1:-1])
 
     def _change_handler(self, new_handler):
         if new_handler == self._current_handler:
@@ -474,9 +464,11 @@ class MixPadHandler(ModeHandlerBase):
                     self._update_solo(ccnum, ccval)
 
     def _upload_mode_layout_to_device(self):
-        # cmd = SysExQueryProgram()
-        # msg = bytes.fromhex("F0 {} F7".format(cmd))
-        # lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))
+        print("QUERY mode layout!")
+        cmd = SysExQueryProgram()
+        msg = bytes.fromhex("F0 {} F7".format(cmd))
+        lib_zyncore.dev_send_midi_event(self._idev_out, msg, len(msg))
+        return
 
         cmd = SysExSetProgram(
             name = "Zynthian MIXPAD",

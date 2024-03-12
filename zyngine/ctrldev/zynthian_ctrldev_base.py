@@ -41,6 +41,7 @@ class CONST:
 	MIDI_NOTE_OFF  = 0x08
 	MIDI_CC        = 0x0B
 	MIDI_PC        = 0x0C
+	MIDI_SYSEX     = 0xF0
 	MIDI_CLOCK     = 0xF8
 	MIDI_CONTINUE  = 0xFB
 
@@ -71,7 +72,6 @@ class zynthian_ctrldev_base:
 		self.chain_manager = state_manager.chain_manager
 		self.idev = idev_in		       # Slot index where the input device is connected, starting from 1 (0 = None)
 		self.idev_out = idev_out       # Slot index where the output device (feedback), if any, is connected, starting from 1 (0 = None)
-		self.init()
 
 	# Send SysEx universal inquiry.
 	# It's answered by some devices with a SysEx message.
@@ -115,6 +115,15 @@ class zynthian_ctrldev_base:
 	def sleep_off(self):
 		self.refresh()
 
+	# Return driver's state dictionary
+	# *COULD* be implemented by child class
+	def get_state(self):
+		return None
+
+	# Restore driver's state
+	# *COULD* be implemented by child class
+	def set_state(self, state):
+		pass
 
 # ------------------------------------------------------------------------------------------------------------------
 # Zynpad control device base class
@@ -469,6 +478,9 @@ class ModeHandlerBase:
 		pass
 
 	def cc_change(self, ccnum, ccval):
+		pass
+
+	def sysex_message(self, payload):
 		pass
 
 	def get_state(self):

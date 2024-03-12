@@ -214,23 +214,10 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
         for signal, subsignal, callback in self._signals:
             zynsigman.register(signal, subsignal, callback)
 
-        #!FIXME: just for developing, remove!
-        from pathlib import Path
-        import json
-        saved = Path("/root/apc-key25-mk2-save.json")
-        if saved.exists():
-            self.set_state(json.load(saved.open()))
-
     def end(self):
         for signal, subsignal, callback in self._signals:
             zynsigman.unregister(signal, subsignal, callback)
         super().end()
-
-        #!FIXME: just for developing, remove!
-        from pathlib import Path
-        import json
-        with Path("/root/apc-key25-mk2-save.json").open("w") as dst:
-            json.dump(self.get_state(), dst, indent=4)
 
     def refresh(self):
         # PadMatrix is handled in volume/pan modes (when mixer handler is active)
