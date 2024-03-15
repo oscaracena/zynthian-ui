@@ -303,7 +303,7 @@ class RunTimer(Thread):
 		try:
 			callback(name, *args, **kwargs)
 		except Exception as ex:
-			print(f" error in handler: {ex}")
+			logging.error(f" error in handler: {ex}")
 
 
 # --------------------------------------------------------------------------
@@ -402,7 +402,7 @@ class ButtonTimer(Thread):
 		try:
 			self._callback(note, ptype)
 		except Exception as ex:
-			print(f"ERROR in handler: {ex}")
+			logging.error(f" error in handler: {ex}")
 
 
 # --------------------------------------------------------------------------
@@ -511,7 +511,7 @@ class ModeHandlerBase:
 			try:
 				action(*args, **kwargs)
 			except Exception as ex:
-				print(f" error in handler: {ex}")
+				logging.error(f" error in handler: {ex}")
 
 	def _request_action(self, receiver, action, *args, **kwargs):
 		self._pending_actions.append((receiver, action, args, kwargs))

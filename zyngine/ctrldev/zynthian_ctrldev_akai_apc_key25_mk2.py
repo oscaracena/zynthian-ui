@@ -28,6 +28,7 @@ import time
 import multiprocessing as mp
 import signal
 import jack
+import logging
 from bisect import bisect
 from functools import partial
 from copy import deepcopy
@@ -334,9 +335,8 @@ class zynthian_ctrldev_akai_apc_key25_mk2(zynthian_ctrldev_zynmixer, zynthian_ct
             ccval = ev[2] & 0x7F
             return self._current_handler.cc_change(ccnum, ccval)
 
-        # SysEx
         elif ev[0] == EV_SYSEX:
-            logging.info(f"Received SysEx => {ev}")
+            logging.info(f" received SysEx => {ev}")
             return True
 
     def light_off(self):
@@ -1532,7 +1532,7 @@ class NotePlayer(Thread):
             try:
                 self._tick()
             except Exception as ex:
-                print(f"ERROR: on note player: {ex}")
+                logging.error(f" error on note player: {ex}")
             time.sleep(self._clock_cycles_to_ms(1) / 1000)
 
     def stop(self, note, channel):
@@ -2329,7 +2329,7 @@ class StepSeqHandler(ModeHandlerBase):
                     return
                 pattern = self._libseq.createPattern()
                 if not self._add_pattern_to_end_of_track(bank, seq, track, pattern):
-                    print("error: could not add a new pattern!")
+                    logging.error(" could not add a new pattern!")
                     return
                 self._sequence_patterns.append(pattern)
 
@@ -2448,7 +2448,7 @@ class StepSeqHandler(ModeHandlerBase):
             if Control.KIND == kind:
                 break
         else:
-            print(f"ERROR: Control kind not supported: {kind}")
+            logging.error(f" control kind not supported: {kind}")
             return False
 
         notes = {}
