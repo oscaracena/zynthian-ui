@@ -478,10 +478,10 @@ class DeviceHandler(ModeHandlerBase):
                     "ALL_SOUNDS_OFF" if is_bold else "STOP"
                 ]
             ),
-            BTN_KNOB_1: (lambda is_bold: [f"ZYNSWITCH:0,{'B' if is_bold else 'S'}"]),
-            BTN_KNOB_2: (lambda is_bold: [f"ZYNSWITCH:1,{'B' if is_bold else 'S'}"]),
-            BTN_KNOB_3: (lambda is_bold: [f"ZYNSWITCH:2,{'B' if is_bold else 'S'}"]),
-            BTN_KNOB_4: (lambda is_bold: [f"ZYNSWITCH:3,{'B' if is_bold else 'S'}"]),
+            BTN_KNOB_1: (lambda is_bold: [f"V5_ZYNPOT_SWITCH:0,{'B' if is_bold else 'S'}"]),
+            BTN_KNOB_2: (lambda is_bold: [f"V5_ZYNPOT_SWITCH:1,{'B' if is_bold else 'S'}"]),
+            BTN_KNOB_3: (lambda is_bold: [f"V5_ZYNPOT_SWITCH:2,{'B' if is_bold else 'S'}"]),
+            BTN_KNOB_4: (lambda is_bold: [f"V5_ZYNPOT_SWITCH:3,{'B' if is_bold else 'S'}"]),
         }
 
         self._btn_states = {k:-1 for k in self._btn_actions}
@@ -532,7 +532,7 @@ class DeviceHandler(ModeHandlerBase):
             elif note in (BTN_RIGHT, BTN_PAD_RIGHT):
                 self._state_manager.send_cuia("ARROW_RIGHT")
             elif note == BTN_SEL_YES:
-                self._state_manager.send_cuia("ZYNSWITCH", [3, 'S'])
+                self._state_manager.send_cuia("V5_ZYNPOT_SWITCH", [3, 'S'])
             elif note == BTN_BACK_NO:
                 self._state_manager.send_cuia("BACK")
             elif note == BTN_ALT:
@@ -2401,18 +2401,6 @@ class StepSeqHandler(ModeHandlerBase):
                 if i == self._selected_pattern_idx:
                     color = COLOR_RED
             self._leds.led_on(pad, color, mode, overlay=overlay)
-
-    def _add_pattern_to_end_of_track(self, bank, seq, track, pattern):
-        pos = 0
-        if self._libseq.getTracksInSequence(bank, seq) != 0:
-            pos = self._libseq.getSequenceLength(bank, seq)
-            while pos > 0:
-                # Arranger's offset step is a quarter note (24 clocks)
-                if self._libseq.getPatternAt(bank, seq, track, pos - 24) != -1:
-                    break
-                pos -= 24
-
-        return self._libseq.addPattern(bank, seq, track, pos, pattern)
 
     def _get_step_colors(self):
         retval = []

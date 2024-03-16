@@ -480,6 +480,9 @@ class ModeHandlerBase:
 	def cc_change(self, ccnum, ccval):
 		pass
 
+	def pg_change(self, program):
+		pass
+
 	def sysex_message(self, payload):
 		pass
 
@@ -552,7 +555,7 @@ class ModeHandlerBase:
 			retval.extend(self._get_patterns_in_track(bank, seq, track))
 		return retval
 
-	# FIXME: Could this be in zynseq?
+	# FIXME: Could this be in libseq?
 	def _get_patterns_in_track(self, bank, seq, track):
 		retval = []
 		n_patts = self._libseq.getPatternsInTrack(bank, seq, track)
@@ -571,6 +574,19 @@ class ModeHandlerBase:
 				pos += 24
 		return retval
 
+	# FIXME: Could this be in libseq?
+	def _add_pattern_to_end_of_track(self, bank, seq, track, pattern):
+		pos = 0
+		if self._libseq.getTracksInSequence(bank, seq) != 0:
+			pos = self._libseq.getSequenceLength(bank, seq)
+			while pos > 0:
+				# Arranger's offset step is a quarter note (24 clocks)
+				if self._libseq.getPatternAt(bank, seq, track, pos - 24) != -1:
+					break
+				pos -= 24
+
+		return self._libseq.addPattern(bank, seq, track, pos, pattern)
+
 	# FIXME: Could this be in zynseq?
 	def _set_note_duration(self, step, note, duration):
 		velocity = self._libseq.getNoteVelocity(step, note)
@@ -582,15 +598,39 @@ class ModeHandlerBase:
 		self._libseq.setStutterDur(step, note, stutt_duration)
 
 	# FIXME: This way avoids to show Zynpad every time, BUT is coupled to UI!
-	def _show_pattern_editor(self, seq):
+	def _show_pattern_editor(self, seq=None, skip_arranger=False):
 		if self._current_screen != 'pattern_editor':
 			self._state_manager.send_cuia("SCREEN_ZYNPAD")
-		self._select_pad(seq)
-		zynthian_gui_config.zyngui.screens["zynpad"].show_pattern_editor()
+		if seq is not None:
+			self._select_pad(seq)
+		if not skip_arranger:
+			zynthian_gui_config.zyngui.screens["zynpad"].show_pattern_editor()
+		else:
+			zynthian_gui_config.zyngui.show_screen("pattern_editor")
+
+	# FIXME: This is coupled to UI!
+	def force_show_pattern_editor(self):
+		self._refresh_pattern_editor()
+		zynthian_gui_config.zyngui.show_screen("pattern_editor")
 
 	# FIXME: This SHOULD be a CUIA, not this hack! (is coupled with UI)
 	def _select_pad(self, pad):
 		zynthian_gui_config.zyngui.screens["zynpad"].select_pad(pad)
+
+	# This SHOULD not be coupled to UI! This is needed because when the pattern is changed in
+	# zynseq, it is not reflected in pattern editor.
+	def _refresh_pattern_editor(self):
+		index = self._zynseq.libseq.getPatternIndex()
+		zynthian_gui_config.zyngui.screens["pattern_editor"].load_pattern(index)
+
+	# FIXME: This SHOULD not be coupled to UI!
+	def _get_selected_sequence(self):
+		return zynthian_gui_config.zyngui.screens["zynpad"].selected_pad
+
+	# FIXME: This SHOULD not be coupled to UI!
+	def _get_selected_step(self):
+		pe = zynthian_gui_config.zyngui.screens["pattern_editor"]
+		return pe.keymap[pe.selected_cell[1]]['note'], pe.selected_cell[0]
 
 	# FIXME: This SHOULD be a CUIA, not this hack! (is coupled with UI)
 	# NOTE: It runs in a thread to avoid lagging the hardware interface
