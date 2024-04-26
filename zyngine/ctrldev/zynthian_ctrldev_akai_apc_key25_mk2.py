@@ -1,13 +1,13 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-#******************************************************************************
+# ******************************************************************************
 # ZYNTHIAN PROJECT: Zynthian Control Device Driver
 #
 # Zynthian Control Device Driver for "Akai APC Key 25 mk2"
 #
 # Copyright (C) 2023,2024 Oscar Aceña <oscaracena@gmail.com>
 #
-#******************************************************************************
+# ******************************************************************************
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License as
@@ -21,26 +21,28 @@
 #
 # For a full copy of the GNU General Public License see the LICENSE.txt file.
 #
-#******************************************************************************
-
+# ******************************************************************************
 
 import time
-import multiprocessing as mp
 import signal
 import jack
 import logging
 from bisect import bisect
-from functools import partial
 from copy import deepcopy
+from functools import partial
+import multiprocessing as mp
 from threading import Thread, RLock, Event
-from zyngine.zynthian_engine_audioplayer import zynthian_engine_audioplayer
-from zyngine.zynthian_signal_manager import zynsigman
-from zyncoder.zyncore import lib_zyncore
+
 from zynlibs.zynseq import zynseq
+from zyncoder.zyncore import lib_zyncore
+from zyngine.zynthian_signal_manager import zynsigman
+from zyngine.zynthian_engine_audioplayer import zynthian_engine_audioplayer
 
 from .zynthian_ctrldev_base import (
-    zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad, RunTimer,
-    KnobSpeedControl, ButtonTimer, CONST
+    zynthian_ctrldev_zynmixer, zynthian_ctrldev_zynpad
+)
+from .zynthian_ctrldev_base_extended import (
+    RunTimer, KnobSpeedControl, ButtonTimer, CONST
 )
 from .zynthian_ctrldev_base_ui import ModeHandlerBase
 
@@ -652,7 +654,6 @@ class MixerHandler(ModeHandlerBase):
     def __init__(self, state_manager, leds: FeedbackLEDs):
         super().__init__(state_manager)
         self._leds = leds
-        self._is_shifted = False
         self._knobs_function = FN_VOLUME
         self._track_buttons_function = FN_SELECT
         self._chains_bank = 0
