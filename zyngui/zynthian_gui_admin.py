@@ -629,20 +629,23 @@ class zynthian_gui_admin(zynthian_gui_selector_info):
         self.update_list()
 
     def about(self):
-        self.zyngui.show_info("System Info\n\n")
-        for repo in ["zyncoder", "zynthian-ui", "zynthian-sys", "zynthian-data", "zynthian-webconf"]:
-            info = self.state_manager.get_repo_info(repo)
-            tag = ""
-            minor = 0
-            for t in info[3]:
-                try:
-                    x,y = t.split(".", 1)
-                    if int(y) > minor:
-                        minor = int(y)
-                        tag = t
-                except:
-                    pass
-            self.zyngui.add_info(f"{repo}: {info[0]} {tag}\n")
+        self.zyngui.show_info("System Info\n")
+        version = zynconf.get_system_version()
+        if version:
+            self.zyngui.add_info(f"System software version {version}.\n\n")
+        else:
+            self.zyngui.add_info("System software not on consistent version.\n\n")
+        self.zyngui.add_info("Software Repositories:\n")
+        for repo in zynconf.zynthian_repositories:
+            path = f"/zynthian/{repo}"
+            info = zynconf.get_git_version_info(path)
+            if info['tag']:
+                if info['name']:
+                    self.zyngui.add_info(f"{repo}: {info['name']} {info['major']}.{info['minor']}.{info['patch']}\n")
+                else:
+                    self.zyngui.add_info(f"{repo}: {info['tag']}\n")
+            else:
+                self.zyngui.add_info(f"{repo}: {info['branch']}\n")
 
     def update_software(self):
         logging.info("UPDATE SOFTWARE")

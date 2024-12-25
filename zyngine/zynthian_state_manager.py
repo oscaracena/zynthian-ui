@@ -2722,24 +2722,6 @@ class zynthian_state_manager:
         except:
             return False
 
-    def get_repo_info(self, repo):
-        path = f"/zynthian/{repo}"
-        try:
-            branch = check_output(f"git symbolic-ref -q --short HEAD",
-                encoding="utf-8", shell=True).strip()
-        except:
-            branch = check_output(f"git describe --tags --exact-match",
-                encoding="utf-8", shell=True).strip()
-        local_hash = check_output(f"git -C {path} rev-parse {branch}",
-            encoding="utf-8", shell=True).strip()
-        try:
-            remote_hash = check_output(f"git -C {path} ls-remote origin {branch}",
-                encoding="utf-8", shell=True).strip().split("\t")[0]
-        except:
-            remote_hash = ""
-        tags = check_output(f"git tag --points-at {local_hash}", encoding="utf-8", shell=True).split()
-        return [branch, local_hash, remote_hash, tags]
-
     def check_for_updates(self):
         if self.checking_for_updates:
             return
@@ -2751,7 +2733,9 @@ class zynthian_state_manager:
                 repos = ["zynthian-ui", "zynthian-sys", "zynthian-webconf", "zynthian-data", "zyncoder"]
                 # If attached to last stable => Detect if new tag relase available
                 for repo in repos:
-                    branch, local_hash, remote_hash, tags = self.get_repo_info(repo)
+                    path = f"/zynthian/{repo}"
+                    local_hash = zynconf.get_git_local_hash(path)
+                    remote_hash = zynconf.get_git_remote_hash(path, "HEAD")
                     #logging.debug(f"*********** BRANCH {branch} => local hash {local_hash}, remote hash {remote_hash} ****************")
                     if local_hash != remote_hash:
                         self.update_available = True
