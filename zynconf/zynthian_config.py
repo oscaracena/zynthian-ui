@@ -200,7 +200,7 @@ def get_git_tag(path):
 def get_git_local_hash(path):
     # Get the hash of the current commit for a git branch or None if invalid
     try:
-        return check_output(f"git -C {path} rev-parse origin",
+        return check_output(f"git -C {path} rev-parse HEAD",
             encoding="utf-8", shell=True).strip()
     except:
         return None
@@ -230,7 +230,6 @@ def get_git_version_info(path):
     frozen = False
     if tag is not None:
         # Check if it is a major release channel
-        frozen = True
         parts = tag.split("-", 1)
         if len(parts) == 2:
             release_name = parts[0]
@@ -242,6 +241,7 @@ def get_git_version_info(path):
             patch_version = parts[2]
         if len(parts) > 1:
             minor_version = parts[1]
+            frozen = True
         else:
             # On stable release channel. Check which point release we are on.
             tags = check_output(f"git -C {path} tag --points-at {tag}", encoding="utf-8", shell=True).split()
@@ -251,10 +251,11 @@ def get_git_version_info(path):
                     continue
                 v_parts = parts[1].split(".", 3)
                 try:
+                    major_version = int(major_version)
                     x = int(v_parts[0])
                     y = z = 0
                     if len(v_parts) > 1:
-                        y = v_parts[1]
+                        y = int(v_parts[1])
                         if len(v_parts) > 2:
                             z = int(v_parts[2])
                     if x > major_version:
@@ -280,11 +281,14 @@ def get_git_version_info(path):
     }
     return result
 
+def update_git(path):
+    check_output(f"git -C {path} remote update origin --prune", shell=True)
+
 def get_git_tags(path, refresh=False):
     # Get list of tags in a git repository
     try:
         if refresh:
-            check_output(f"git -C {path} remote update origin --prune", shell=True)
+            update_git(path)
         return sorted(check_output(f"git -C {path} tag", encoding="utf-8", shell=True).split(), key=str.casefold)
     except:
         return []
@@ -293,7 +297,7 @@ def get_git_branches(path, refresh=False):
     # Get list of branches in a git repository
     result = []
     if refresh:
-        check_output(f"git -C {path} remote update origin --prune", shell=True)
+        update_git(path)
     for branch in check_output(f"git -C {path} branch -a", encoding="utf-8", shell=True).splitlines():
         branch = branch.strip()
         if branch.startswith("*"):
