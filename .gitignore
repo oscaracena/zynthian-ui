@@ -2,5 +2,5 @@
 .*~
 __pycache__
 zynlibs/*/build
-.vscode/launch.json
+.vscode
 .idea
