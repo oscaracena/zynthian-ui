@@ -711,19 +711,19 @@ class MixerHandler(ModeHandlerBase):
                 return
 
             query = {
-                FN_MUTE: self._zynmixer.get_mute,
-                FN_SOLO: self._zynmixer.get_solo,
-                FN_SELECT: self._is_active_chain,
+                FN_MUTE: lambda c: self._zynmixer.get_mute(c.mixer_chan),
+                FN_SOLO: lambda c: self._zynmixer.get_solo(c.mixer_chan),
+                FN_SELECT: lambda c: c.chain_id == self._active_chain,
             }[self._track_buttons_function]
             for i in range(8):
-                index = i + (8 if self._chains_bank == 1 else 0)
-                chain = self._chain_manager.get_chain_by_index(index)
+                pos = i + (8 if self._chains_bank == 1 else 0)
+                chain = self._chain_manager.get_chain_by_position(pos)
                 if not chain:
                     break
                 # Main channel ignored
                 if chain.chain_id == 0:
                     continue
-                self._leds.led_state(BTN_TRACK_1 + i, query(index))
+                self._leds.led_state(BTN_TRACK_1 + i, query(chain))
 
     def on_shift_changed(self, state):
         retval = super().on_shift_changed(state)
@@ -785,10 +785,18 @@ class MixerHandler(ModeHandlerBase):
     def update_strip(self, chan, symbol, value):
         if {"mute": FN_MUTE, "solo": FN_SOLO}.get(symbol) != self._track_buttons_function:
             return
-        chan -= self._chains_bank * 8
-        if 0 > chan > 8:
+
+        # Mixer 'chan' may not be equal to its position (if re-arranged or a
+        # chain was deleted). Search the actual displayed position.
+        chain_id = self._chain_manager.get_chain_id_by_mixer_chan(chan)
+        for pos in range(self._chain_manager.get_chain_count()):
+            if self._chain_manager.get_chain_id_by_index(pos) == chain_id:
+                break
+
+        pos -= self._chains_bank * 8
+        if 0 > pos > 8:
             return
-        self._leds.led_state(BTN_TRACK_1 + chan, value)
+        self._leds.led_state(BTN_TRACK_1 + pos, value)
         return True
 
     def set_active_chain(self, chain, refresh):
@@ -799,12 +807,6 @@ class MixerHandler(ModeHandlerBase):
         self._active_chain = chain
         if refresh:
             self.refresh()
-
-    def _is_active_chain(self, position):
-        chain = self._chain_manager.get_chain_by_position(position)
-        if chain is None:
-            return False
-        return chain.chain_id == self._active_chain
 
     def _update_volume(self, ccnum, ccval):
         return self._update_control("level", ccnum, ccval, 0, 100)
