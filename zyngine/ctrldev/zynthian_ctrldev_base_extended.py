@@ -28,22 +28,25 @@ import logging
 from bisect import bisect
 from threading import Thread, RLock, Event
 
+from zyncoder.zyncore import lib_zyncore
+
 
 class CONST:
     # Some MIDI event constants
-    MIDI_NOTE_ON = 0x09
-    MIDI_NOTE_OFF = 0x08
-    MIDI_CC = 0x0B
-    MIDI_PC = 0x0C
-    MIDI_SYSEX = 0xF0
-    MIDI_CLOCK = 0xF8
-    MIDI_CONTINUE = 0xFB
+    MIDI_NOTE_ON     = 0x90
+    MIDI_NOTE_OFF    = 0x80
+    MIDI_CC          = 0xB0
+    MIDI_PC          = 0xC0
+    MIDI_SYSEX_START = 0xF0
+    MIDI_SYSEX_END   = 0xF7
+    MIDI_CLOCK       = 0xF8
+    MIDI_CONTINUE    = 0xFB
 
-    PT_SHORT = "short"
-    PT_BOLD = "bold"
-    PT_LONG = "long"
-    PT_BOLD_TIME = 0.3
-    PT_LONG_TIME = 2.0
+    PT_SHORT         = "short"
+    PT_BOLD          = "bold"
+    PT_LONG          = "long"
+    PT_BOLD_TIME     = 0.3
+    PT_LONG_TIME     = 2.0
 
 
 # --------------------------------------------------------------------------
@@ -217,7 +220,7 @@ class ButtonTimer(Thread):
 
 
 # --------------------------------------------------------------------------
-#  Helper class to handle knobs' speed
+# Helper class to handle knobs' speed
 # --------------------------------------------------------------------------
 class KnobSpeedControl:
     def __init__(self, steps_normal=3, steps_shifted=8):
@@ -240,6 +243,68 @@ class KnobSpeedControl:
 
         self._knobs_ease[ccnum] = 0
         return delta
+
+
+# --------------------------------------------------------------------------
+# Feedback LEDs controller
+# --------------------------------------------------------------------------
+class FeedbackLEDsBase:
+
+    # NOTE: Derive this class, and define the button lists
+    PAD_BUTTONS = []
+    CTRL_BUTTONS = []
+
+    def __init__(self, idev, send_note_fn=None):
+        self._idev = idev
+        self._state = {}
+        self._timer = RunTimer()
+        self._send_note_on = send_note_fn or lib_zyncore.dev_send_note_on
+
+    def all_off(self):
+        self.control_leds_off()
+        self.pad_leds_off()
+
+    def control_leds_off(self):
+        for btn in self.CTRL_BUTTONS:
+            self.led_off(btn)
+
+    def pad_leds_off(self):
+        for btn in self.PAD_BUTTONS:
+            self.led_off(btn)
+
+    def led_state(self, led, state):
+        (self.led_on if state else self.led_off)(led)
+
+    def led_off(self, led, overlay=False):
+        self._timer.remove(led)
+        self._send_note_on(self._idev, 0, led, 0)
+        if not overlay:
+            self._state[led] = (0, 0)
+
+    def led_on(self, led, color=1, mode=0, overlay=False):
+        self._timer.remove(led)
+        self._send_note_on(self._idev, mode, led, color)
+        if not overlay:
+            self._state[led] = (color, mode)
+
+    def led_blink(self, led):
+        self._timer.remove(led)
+        self._send_note_on(self._idev, 0, led, 2)
+
+    def remove_overlay(self, led):
+        old_state = self._state.get(led)
+        if old_state:
+            self.led_on(led, *old_state)
+        else:
+            self._timer.remove(led)
+            self._send_note_on(self._idev, 0, led, 0)
+
+    def delayed(self, action, timeout, led, *args, **kwargs):
+        action = getattr(self, action)
+        self._timer.add(led, timeout, action, *args, **kwargs)
+
+    def clear_delayed(self, led):
+        self._timer.remove(led)
 
 
 # --------------------------------------------------------------------------

@@ -30,9 +30,7 @@ from bisect import bisect
 from zyncoder.zyncore import lib_zyncore
 from zyngine.zynthian_signal_manager import zynsigman
 
-from .zynthian_ctrldev_base import (
-    zynthian_ctrldev_zynmixer
-)
+from .zynthian_ctrldev_base import zynthian_ctrldev_zynmixer
 from .zynthian_ctrldev_base_extended import (
     CONST, KnobSpeedControl, IntervalTimer, ButtonTimer
 )
@@ -384,7 +382,7 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
             self._current_handler.set_active(True)
 
     def midi_event(self, ev: bytes):
-        evtype = (ev[0] >> 4) & 0x0F
+        evtype = ev[0] & 0xF0
 
         if evtype == CONST.MIDI_PC:
             program = ev[1] & 0x7F
@@ -436,7 +434,7 @@ class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
             ccval = ev[2] & 0x7F
             self._current_handler.cc_change(ccnum, ccval)
 
-        elif ev[0] == CONST.MIDI_SYSEX:
+        elif ev[0] == CONST.MIDI_SYSEX_START:
             if len(ev) == 254 and self._saved_mpk_program is None:
                 self._saved_mpk_program = ev[1:-1]
 

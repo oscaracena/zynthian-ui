@@ -11,5 +11,7 @@ __all__ = [
     "zynthian_ctrldev_launchpad_pro_mk2",
     "zynthian_ctrldev_launchpad_pro_mk3",
     "zynthian_ctrldev_launchpad_x",
-    "zynthian_ctrldev_riband"
+    "zynthian_ctrldev_riband",
+
+    "zynthian_ctrldev_nakama",
 ]
