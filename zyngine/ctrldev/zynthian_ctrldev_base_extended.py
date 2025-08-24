@@ -124,8 +124,7 @@ class IntervalTimer(RunTimer):
 
     def add(self, name, timeout, callback, *args, **kwargs):
         with self._lock:
-            self._actions[name] = [timeout, timeout,
-                                   callback, name, args, kwargs]
+            self._actions[name] = [0, timeout, callback, name, args, kwargs]
         self._awake.set()
 
     def update(self, name, timeout):
