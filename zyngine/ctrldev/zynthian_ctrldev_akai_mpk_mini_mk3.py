@@ -324,6 +324,7 @@ class SavedState:
 class zynthian_ctrldev_akai_mpk_mini_mk3(zynthian_ctrldev_zynmixer):
 
     dev_ids = ["MPK mini 3 IN 1"]
+    driver_name = "MPK Mini mk3"
     unroute_from_chains = False
 
     @classmethod
