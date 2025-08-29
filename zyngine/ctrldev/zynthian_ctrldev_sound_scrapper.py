@@ -43,9 +43,14 @@ from zyngine import zynthian_lv2
 from zyngui import zynthian_gui_config
 
 
+# Storage directory
 STORAGE = Path("./soundlib").absolute()
+ex_data_dir = os.environ.get('ZYNTHIAN_EX_DATA_DIR', "/media/root")
+exdirs = zynthian_gui_config.get_external_storage_dirs(ex_data_dir)
+if exdirs:
+    STORAGE = (Path(exdirs[0]) / "soundlib").absolute()
 
-# global logger
+# Global logger
 log_level = int(os.environ.get('ZYNTHIAN_LOG_LEVEL', logging.INFO))
 log = logging.getLogger("SoundLibCreator")
 log.propagate = False
@@ -54,7 +59,7 @@ log_handler = logging.StreamHandler()
 log_handler.setFormatter(logging.Formatter("%(message)s"))
 log.addHandler(log_handler)
 
-# file handler for logger, to save a record of this execution
+# File handler for logger, to save a record of this execution
 log_dir = STORAGE / "logs"
 log_dir.mkdir(parents=True, exist_ok=True)
 log_file = log_dir / f"execution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -73,7 +78,7 @@ PSW = "::\033[1;33mSndLib\033[0m>"
 # --------------------------------------------------------------------------
 # SoundLib, a library of sounds for Zynthian
 # --------------------------------------------------------------------------
-class zynthian_ctrldev_soundlib(zynthian_ctrldev_base):
+class zynthian_ctrldev_sound_scrapper(zynthian_ctrldev_base):
     _instance = None
     _initialized = False
 
@@ -88,7 +93,7 @@ class zynthian_ctrldev_soundlib(zynthian_ctrldev_base):
     # NOTE: This class is a singleton because Zynthian wants to create many instances of it
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            cls._instance = super(zynthian_ctrldev_soundlib, cls).__new__(cls)
+            cls._instance = super(zynthian_ctrldev_sound_scrapper, cls).__new__(cls)
         return cls._instance
 
     def __init__(self, state_manager, idev_in, idev_out):
@@ -106,6 +111,16 @@ class SoundLibCreator(Thread):
     MIDI_CH           = 9
     SILENCE_THRESHOLD = 0.2  # in range [0, 1]
 
+    # Songs played for melodic instruments, NAME: [bpm, notes]
+    SONGS = {
+        # Single note, middle C
+        "A": [30, "C4"],
+        # Cmin arpeggio and Cmin chords
+        "B": [60, "C4 Eb4 G4 -, [C4 Eb4 G4]"],
+        # I-V-vi-IV chord progression on C major
+        "C": [60, "[C4 E4 G4], -, [G4 B4 D4], -, [A4 C4 E4], -, [F4 A4 C4]"],
+    }
+
     def __init__(self, state_manager, converter: "MediaConverter"):
         super().__init__()
         self._state_manager = state_manager
@@ -118,6 +133,7 @@ class SoundLibCreator(Thread):
         self._clips_dir = STORAGE / "clips"
         self._clips_dir.mkdir(parents=True, exist_ok=True)
         self._clips_db = ClipsDB(STORAGE / "clips.json")
+        {self._clips_db.define_song(name, spec) for name, spec in self.SONGS.items()}
 
         self.dameon = True
         self.start()
@@ -202,28 +218,14 @@ class SoundLibCreator(Thread):
             if idx >= 10: return
 
     def _record_melodic(self, name):
-        songs = {
-            # Single note, C
-            "A": dict(
-                content="C4", clip=None),
+        clips = {}
+        for song_name, spec in self.SONGS.items():
+            bpm, notes = spec
+            filename = self._clips_dir / f"{name}-{song_name}.ogg"
+            self._record_song(notes, bpm=bpm, filename=filename)
+            clips[song_name] = filename.relative_to(STORAGE)
 
-            # Cmaj arpeggio and Cmin chord
-            "B": dict(
-                content="C4 Eb4 G4 -, [C4 Eb4 G4]",
-                clip=None),
-
-            # I-V-vi-IV chord progression on C major
-            "C": dict(
-                content="[C4 E4 G4], -, [G4 B4 D4], -, [A4 C4 E4], -, [F4 A4 C4]",
-                clip=None),
-        }
-
-        for idx, song in songs.items():
-            filename = self._clips_dir / f"{name}-{idx}.ogg"
-            self._record_song(song["content"], bpm=30, filename=filename)
-            song["clip"] = filename.relative_to(STORAGE)
-
-        return songs
+        return clips
 
     def _record_song(self, song, bpm, filename: Path):
         # Some examples:
@@ -234,6 +236,7 @@ class SoundLibCreator(Thread):
 
         self._wait_for_silence(force=True)
         self._start_recording()
+        time.sleep(0.2)
 
         log.info(f"  - 🔴 REC: '{song}', file: {filename.name}")
         bars = map(str.strip, song.split(","))
@@ -294,8 +297,15 @@ class SoundLibCreator(Thread):
             self._state_manager.all_notes_off()
             self._state_manager.all_sounds_off()
 
+        start = time.monotonic()
         while True:
             if self._get_sound_level() < self.SILENCE_THRESHOLD:
+                return
+
+            # Keep waiting up to 5 seconds, otherwise force silence
+            if time.monotonic() - start > 5:
+                self._state_manager.all_notes_off()
+                self._state_manager.all_sounds_off()
                 return
             time.sleep(0.1)
 
@@ -409,8 +419,12 @@ class MediaConverter(Thread):
         # NOTE: Limit resources heavily to avoid xruns on jack
         try:
             cmd = (
-                f"nice -n 15 cpulimit -l 25 -f -- "
-                f"ffmpeg -y -i '{input_file}' -c:a libopus -threads 2 '{output_file}'"
+                "nice -n 15 cpulimit -l 25 -f -- "
+                f"ffmpeg -y -i '{input_file}' "
+                "-af \"silenceremove=start_periods=1:start_silence=0.2:start_threshold=-50dB,"
+                "areverse,silenceremove=start_periods=1:start_silence=0.2:start_threshold=-50dB,"
+                "areverse\" "
+                f"-c:a libopus -threads 2 '{output_file}'"
             )
             self._running_p = subprocess.Popen(
                 cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -447,6 +461,7 @@ class ClipsDB:
 
         self._engines = {}
         self._clips = {}
+        self._songs = {}
 
         if self._filename.exists():
             self.load()
@@ -460,8 +475,12 @@ class ClipsDB:
         self._engines[engine.spec_name] = {k:values[k] for k in keys}
         self.save(auto=True)
 
-    def add_clips(self, engine: str, bank: str, preset: str, clips: Path):
+    def define_song(self, name, spec):
+        self._songs[name] = dict(bpm=spec[0], notes=spec[1])
+
+    def add_clips(self, engine: str, bank: str, preset: str, clips: dict):
         self._clips.setdefault(engine, {}).setdefault(bank, {})[preset] = clips
+        clips["tags"] = TagClassifer.extract_tags(engine, bank, preset)
         self.save(auto=True)
 
     def exists(self, engine: str, bank: str, preset: str):
@@ -471,7 +490,7 @@ class ClipsDB:
         if not isinstance(clips, dict) or len(clips) < 1:
             return False
         for song in clips.values():
-            path = STORAGE / song.get("clip", "/not-exists")
+            path = STORAGE / song.get("clip", "/must-not-exist")
             if not path.exists():
                 return False
         return True
@@ -480,15 +499,12 @@ class ClipsDB:
         with self._filename.open("r") as src:
             data = json.load(src)
 
-        self._engines = data.get("engines")
-        self._clips = data.get("clips")
-
-        if self._engines is None:
-            log.error(f"{PSW} ERROR: loading DB from {self._filename}, missing 'engines'!")
-            self._engines = {}
-        if self._clips is None:
-            log.error(f"{PSW} ERROR: loading DB from {self._filename}, missing 'clips'!")
-            self._clips = {}
+        for field in ["engines", "clips", "songs"]:
+            value = data.get(field)
+            if value is None:
+                log.error(f"{PSW} ERROR: loading DB from {self._filename}, missing '{field}'!")
+                value = {}
+            setattr(self, f"_{field}", value )
 
     def save(self, auto=False):
         if auto:
@@ -500,6 +516,7 @@ class ClipsDB:
         data = {
             "engines": self._engines,
             "clips": self._clips,
+            "songs": self._songs,
         }
 
         if self._filename.exists():
@@ -507,7 +524,127 @@ class ClipsDB:
         try:
             with self._filename.open("w") as dst:
                 json.dump(data, dst, indent=3, ensure_ascii=False, default=str)
+            size = f"{self._filename.stat().st_size:,}".replace(",", ".")
+            log.info(f"{PS1} Clips DB saved (size: {size} bytes)")
         except Exception as err:
             log.error(f"{PSE} ERROR: Could not save DB to disk: {err}")
             if bkup.exists():
                 shutil.copy(bkup, self._filename)
+
+
+class TagClassifer:
+    KNOWN_TAGS = {
+        # Roland
+        "tb303", "tr606", "tr707", "tr727", "tr808", "tr909",
+        "jp8000", "jp8080", "juno6", "juno60", "juno106",
+        "jupiter4", "jupiter6", "jupiter8",
+        "sh101",
+
+        # Yamaha
+        "dx7", "dx21", "dx100", "tx81z", "cs80",
+
+        # Korg
+        "ms20", "poly800", "dw8000", "m1", "wavestation",
+
+        # Sequential / Oberheim
+        "prophet5", "prophet6", "prophet10", "prophet12", "obx", "obxa", "ob8",
+
+        # Casio
+        "cz101", "cz1000", "vz1",
+
+        # Akai / samplers
+        "s950", "s1000", "s3000", "mpc60", "mpc2000", "mpc2500", "mpc3000",
+
+        # Other
+        "rd808", "mc202", "esq1", "matrix1000"
+    }
+
+    CATEGORIES = {
+        # Keyboards
+        "piano": ["piano", "ep", "rhodes", "clav", "upright", "grand"],
+        "organ": ["organ", "hammond", "tonewheel", "drawbar"],
+        "keys": ["key", "keys", "cp80", "wurli"],
+
+        # Synths
+        "pad": ["pad", "string", "choir", "vox", "atmo", "amb", "texture"],
+        "lead": ["lead", "solo", "synthlead"],
+        "bass": ["bass", "sub", "808", "moog", "acid"],
+        "arp": ["arp", "sequence", "seq"],
+        "poly": ["poly", "chord"],
+        "mono": ["mono", "monosynth"],
+
+        # Drums and percussion
+        "drums": ["drum", "kit", "perc", "percussion"],
+        "kick": ["kick", "bd", "bassdrum"],
+        "snare": ["snare", "sd"],
+        "hihat": ["hh", "hihat", "closed", "openhat"],
+        "cymbal": ["cymbal", "ride", "crash", "splash"],
+        "tom": ["tom", "toms"],
+        "clap": ["clap"],
+        "fxdrums": ["rim", "cowbell", "clave", "woodblock"],
+
+        # Acoustic instruments
+        "guitar": ["guitar", "acoustic", "strum", "plucked"],
+        "electric_guitar": ["eguitar", "dist", "overdrive", "powerchord"],
+        "bass_guitar": ["ebass", "bassguitar", "slap"],
+        "strings": ["violin", "viola", "cello", "contrabass", "strings"],
+        "brass": ["trumpet", "trombone", "horn", "brass"],
+        "woodwind": ["flute", "clarinet", "oboe", "bassoon", "sax"],
+        "ethnic": ["sitar", "koto", "shamisen", "oud", "erhu", "duduk"],
+
+        # Mallets and tonal percussion
+        "bell": ["bell", "mallet", "xylophone", "vibe", "celesta", "glock", "tubular"],
+        "chime": ["chime", "windchime", "tinkle"],
+        "marimba": ["marimba", "balafon"],
+
+        # Effects
+        "fx": ["fx", "effect", "noise", "sweep", "rise", "fall", "impact", "hit"],
+        "soundscape": ["dron", "drone", "ambient", "scape", "cinematic"],
+        "vox": ["vox", "voice", "vocal", "choir", "shout"],
+        "hitstab": ["stab", "hit", "orchestra hit"],
+        "riser": ["riser", "uplifter", "build"],
+        "downer": ["downer", "fall", "drop"],
+
+        # Specific electronic
+        "chiptune": ["chip", "8bit", "gameboy", "sid"],
+        "trance": ["supersaw", "trance", "plucksaw"],
+        "house": ["house", "deep", "tech"],
+        "techno": ["techno", "acid"],
+        "dubstep": ["dubstep", "wobble", "growl"],
+        "trap": ["trap", "808", "hi-hat triplet"],
+
+        # Etnic percussion
+        "latin": ["conga", "bongo", "timbale", "cuica"],
+        "african": ["djembe", "talkingdrum"],
+        "middle_east": ["darbuka", "doumbek", "tabla"],
+        "asian": ["taiko", "gong", "koto"],
+    }
+
+    @classmethod
+    def extract_tags(cls, engine, bank, preset):
+        tags = set()
+
+        tags.add(f"engine:{engine.split('/')[-1].lower()}")
+
+        bank_parts = re.findall(r'[A-Z]?[a-z]+|\d+', bank)
+        for bp in bank_parts:
+            tag = bp.lower()
+            if tag.isdigit() or tag == "bank":
+                continue
+            tags.add(tag)
+
+        preset_clean = preset.split(":", 1)[-1].strip()
+        preset_parts = re.findall(r'[A-Z]?[a-z]+|\d+', preset_clean)
+        for pp in preset_parts:
+            tag = pp.lower()
+            if tag.isdigit() and tag not in cls.KNOWN_TAGS:
+                continue
+            tags.add(tag)
+
+        for cat, keywords in cls.CATEGORIES.items():
+            for kw in keywords:
+                if any(kw in t for t in tags):
+                    tags.add(f"cat:{cat}")
+                    break
+
+        return sorted(tags)
