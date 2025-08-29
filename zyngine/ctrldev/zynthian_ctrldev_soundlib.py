@@ -29,10 +29,13 @@ import time
 import logging
 import shutil
 import subprocess
-from threading import Thread
+import json
+from threading import Thread, current_thread
 from pathlib import Path
 from collections import namedtuple
 from datetime import datetime
+from queue import Queue, Empty
+from typing import NamedTuple
 
 from zyncoder.zyncore import lib_zyncore
 from zyngine.ctrldev.zynthian_ctrldev_base import zynthian_ctrldev_base
@@ -93,7 +96,8 @@ class zynthian_ctrldev_soundlib(zynthian_ctrldev_base):
             return
 
         super().__init__(state_manager, idev_in, idev_out)
-        self._creator = SoundLibCreator(state_manager)
+        self._converter = MediaConverter()
+        self._creator = SoundLibCreator(state_manager, self._converter)
         self._initialized = True
 
 
@@ -102,16 +106,18 @@ class SoundLibCreator(Thread):
     MIDI_CH           = 9
     SILENCE_THRESHOLD = 0.2  # in range [0, 1]
 
-    def __init__(self, state_manager):
+    def __init__(self, state_manager, converter: "MediaConverter"):
         super().__init__()
         self._state_manager = state_manager
         self._zynmixer = state_manager.zynmixer
         self._recorder = state_manager.audio_recorder
+        self._converter = converter
 
         self._chain_id = None
         self._current_processor = None
         self._clips_dir = STORAGE / "clips"
         self._clips_dir.mkdir(parents=True, exist_ok=True)
+        self._clips_db = ClipsDB(STORAGE / "clips.json")
 
         self.dameon = True
         self.start()
@@ -121,6 +127,7 @@ class SoundLibCreator(Thread):
         self._create_chain("SoundLib")
 
         for engine in self._get_engine_list():
+            self._clips_db.define_engine(engine)
             if engine.cat.lower() == "percussion":
                 self._record_rhythmic_samples(engine)
             elif engine.cat.lower() == "synth":
@@ -131,60 +138,10 @@ class SoundLibCreator(Thread):
 
             break
 
-        # # start audio recording
-        # recorder.start_recording()
-        # time.sleep(1)
-
-        # send a C4 for 2 seconds to chain
-        # print(self._get_level())
-        # time.sleep(1)
-        # lib_zyncore.ui_send_note_on(midi_ch, 60, 127)
-        # time.sleep(1)
-        # print(self._get_level())
-        # time.sleep(1)
-        # lib_zyncore.ui_send_note_off(midi_ch, 60, 0)
-        # time.sleep(1)
-        # print(self._get_level())
-
-        # stop audio recording and save audio file
-        # FIXME: monitor out level, and stop on silence
-        # recorder.stop_recording()
-        # print(f"RECORD at: '{recorder.filename}'")
-
-        # # stop all sounds
-        # self._state_manager.all_notes_off()
-        # self._state_manager.all_sounds_off()
-        # time.sleep(1)
-        # print(self._get_level())
-
-        # # remove processor from chain
-        # if not chain_manager.remove_processor(chain_id, processor):
-        #     log.error(f"FAILED to remove processor from chain {chain_id}")
-
-        # create another processor
-        # eng_code = "JV/amsynth"  # melodic synth, presets and banks
-        # processor = chain_manager.add_processor(chain_id, eng_code)
-        # if not processor:
-        #     log.error(f"FAILED to create the engine {eng_code}")
-        # chain_manager.set_active_chain_by_id(chain_id)
-
-        # # NOTE: there is a bug, and first note of first preset sounds bad; flush it here
-        # lib_zyncore.ui_send_note_on(midi_ch, 60, 0)
-        # time.sleep(0.5)
-        # lib_zyncore.ui_send_note_off(midi_ch, 60, 0)
-
-        # lib_zyncore.ui_send_note_on(midi_ch, 60, 60)
-        # time.sleep(1)
-        # lib_zyncore.ui_send_note_off(midi_ch, 60, 0)
-        # time.sleep(1)
-
-        # processor.preload_preset(1)
-        # lib_zyncore.ui_send_note_on(midi_ch, 60, 60)
-        # time.sleep(1)
-        # lib_zyncore.ui_send_note_off(midi_ch, 60, 0)
-        # time.sleep(1)
-
-        print("FINISH")
+        log.info(f"{PS1} Done! Waiting for converter to finish...")
+        self._converter.wait_until_finish()
+        self._clips_db.save()
+        log.info(f"{PS1} Finished! You can now close this app.")
 
     def _get_engine_list(self):
         # FIXME: shall we include other categories? (Audio Generator, Effects, etc.)
@@ -233,22 +190,42 @@ class SoundLibCreator(Thread):
         log.info(f"{PS1} Processing '{engine.spec_name}' as melodic")
         processor = self._create_processor(engine)
         for idx, (bank, preset) in enumerate(self._iter_over_presets(processor)):
+            if self._clips_db.exists(engine.spec_name, bank, preset):
+                log.info(f"- Skipping existing preset {idx}: {bank} > {preset}")
+                continue
             log.info(f"- Recording preset {idx}: {bank} > {preset}")
             name = self._get_clip_name_for_preset(engine.name, bank, preset)
-            self._record_melodic(name)
+            songs = self._record_melodic(name)
+            self._clips_db.add_clips(engine.spec_name, bank, preset, songs)
 
             # FIXME!! REMOVE!!!
-            if idx >= 1: return
+            if idx >= 10: return
 
     def _record_melodic(self, name):
-        self._record_song("C4",
-            bpm=30, filename=self._clips_dir / f"{name}-A.ogg")
-        self._record_song("C4 E4 G4 -, [C4 E4 G4]",
-            bpm=30, filename=self._clips_dir / f"{name}-B.ogg")
-        self._record_song("[C3 Eb3 G3], -, [C5 Eb5 G5]",
-            bpm=60, filename=self._clips_dir / f"{name}-C.ogg")
+        songs = {
+            # Single note, C
+            "A": dict(
+                content="C4", clip=None),
 
-    def _record_song(self, song, bpm, filename):
+            # Cmaj arpeggio and Cmin chord
+            "B": dict(
+                content="C4 Eb4 G4 -, [C4 Eb4 G4]",
+                clip=None),
+
+            # I-V-vi-IV chord progression on C major
+            "C": dict(
+                content="[C4 E4 G4], -, [G4 B4 D4], -, [A4 C4 E4], -, [F4 A4 C4]",
+                clip=None),
+        }
+
+        for idx, song in songs.items():
+            filename = self._clips_dir / f"{name}-{idx}.ogg"
+            self._record_song(song["content"], bpm=30, filename=filename)
+            song["clip"] = filename.relative_to(STORAGE)
+
+        return songs
+
+    def _record_song(self, song, bpm, filename: Path):
         # Some examples:
         # - 'C4', a single C4 sustained all the bar
         # - 'C4 E4 G4 -', a Cmaj chord, arpeggiated in a bar (with a final rest)
@@ -258,7 +235,7 @@ class SoundLibCreator(Thread):
         self._wait_for_silence(force=True)
         self._start_recording()
 
-        log.info(f"  - 🔴 REC: '{song}', file: {filename}")
+        log.info(f"  - 🔴 REC: '{song}', file: {filename.name}")
         bars = map(str.strip, song.split(","))
         for bar in bars:
             is_chord = False
@@ -293,13 +270,13 @@ class SoundLibCreator(Thread):
             midi_notes.append(midi_num)
         return midi_notes
 
-    def _play_notes(self, bar, as_chord=False, tempo=60):
+    def _play_notes(self, bar, as_chord=False, tempo=60, vel=60):
         duration = 60 / tempo
 
         if as_chord:
             for note in bar:
                 if note is not None:
-                    lib_zyncore.ui_send_note_on(self.MIDI_CH, note, 100)
+                    lib_zyncore.ui_send_note_on(self.MIDI_CH, note, vel)
             time.sleep(duration)
             for note in bar:
                 if note is not None:
@@ -307,7 +284,7 @@ class SoundLibCreator(Thread):
         else:
             for note in bar:
                 if note is not None:
-                    lib_zyncore.ui_send_note_on(self.MIDI_CH, note, 100)
+                    lib_zyncore.ui_send_note_on(self.MIDI_CH, note, vel)
                 time.sleep(duration / len(bar))
                 if note is not None:
                     lib_zyncore.ui_send_note_off(self.MIDI_CH, note, 0)
@@ -325,25 +302,13 @@ class SoundLibCreator(Thread):
     def _start_recording(self):
         self._recorder.start_recording()
 
-    def _stop_recording(self, filename):
+    def _stop_recording(self, filename: Path):
         self._recorder.stop_recording()
-
-        # FIXME: create a worker thread that make this job
-        def compress_audio(input_file, output_file):
-            try:
-                subprocess.run([
-                    "nice", "-n", "19",
-                    "cpulimit", "-l", "30", "--",
-                    "ffmpeg", "-y", "-i", input_file, "-c:a", "libopus",
-                    "-threads", "2", output_file,
-                ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                os.remove(input_file)
-                log.info(f"  - {output_file} ready")
-            except Exception as e:
-                log.error(f"{PSE} Failed to compress audio: {e}")
-
-        Thread(target=compress_audio,
-            args=(self._recorder.filename, str(filename)), daemon=True).start()
+        source = Path(self._recorder.filename)
+        if not source.exists():
+            log.error(f"{PSE} ERROR: record file '{source}' does not exists!")
+            return
+        self._converter.add(source, filename)
 
     def _create_chain(self, name, midi_ch=None):
         midi_ch = self.MIDI_CH if midi_ch is None else midi_ch
@@ -369,12 +334,6 @@ class SoundLibCreator(Thread):
             input()
 
     def _wait_until_ready(self):
-        # Check if cpulimit is available, as is needed for ogg convertion
-        if shutil.which("cpulimit") is None:
-            log.error(f"{PSE} 'cpulimit' command not found. Please install it.")
-            raise RuntimeError("'cpulimit' command not found.")
-
-        # Wait until Zynthian is fully initialized
         while True:
             if zynthian_gui_config.zyngui is not None:
                 break
@@ -409,3 +368,146 @@ class SoundLibCreator(Thread):
             camel_to_snake(bank),
             camel_to_snake(preset),
         ])
+
+
+class MediaConverter(Thread):
+    def __init__(self):
+        super().__init__()
+
+        if shutil.which("cpulimit") is None:
+            log.error(f"{PSE} 'cpulimit' command not found. Please install it.")
+            raise RuntimeError("'cpulimit' command not found.")
+
+        self._tasks = Queue()
+        self._running_p = None
+        self._finished = False
+        self._parent_t = current_thread()
+
+        self.daemon = False
+        self.start()
+
+    def add(self, source: Path, destination: Path):
+        self._tasks.put((source, destination))
+
+    def run(self):
+        while not self._finished:
+            try:
+                src, dst = self._tasks.get(timeout=0.25)
+                self._handle_request(src, dst)
+                self._tasks.task_done()
+            except Empty:
+                if not self._parent_t.is_alive():
+                    break
+
+        if not self._tasks.empty():
+            log.warning(f"{PSW} WARNING: There are pending files to be converted!")
+
+    def wait_until_finish(self):
+        self._tasks.join()
+
+    def _handle_request(self, input_file: Path, output_file: Path):
+        # NOTE: Limit resources heavily to avoid xruns on jack
+        try:
+            cmd = (
+                f"nice -n 15 cpulimit -l 25 -f -- "
+                f"ffmpeg -y -i '{input_file}' -c:a libopus -threads 2 '{output_file}'"
+            )
+            self._running_p = subprocess.Popen(
+                cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            while True:
+                try:
+                    if self._running_p.wait(0.25) == 0:
+                        log.info(f"  - {output_file} ready (remains: {self._tasks.qsize()})")
+                    os.remove(input_file)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self._parent_t.is_alive():
+                        continue
+
+                    self._finished = False
+                    self._running_p.terminate()
+                    try:
+                        self._running_p.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self._running_p.kill()
+                    break
+
+        except Exception as e:
+            log.error(f"{PSE} Failed to compress audio: {e}")
+        finally:
+            self._running_p = None
+
+
+class ClipsDB:
+    def __init__(self, filename: Path, auto_save: int = 30):
+        self._filename = filename
+        self._autosave_time = auto_save
+        self._last_saved = 0
+
+        self._engines = {}
+        self._clips = {}
+
+        if self._filename.exists():
+            self.load()
+
+    def define_engine(self, engine: NamedTuple):
+        keys = [
+            "name", "title", "type", "cat", "url", "descr",
+            "quality", "complex", "spec_idx"
+        ]
+        values = engine._asdict()
+        self._engines[engine.spec_name] = {k:values[k] for k in keys}
+        self.save(auto=True)
+
+    def add_clips(self, engine: str, bank: str, preset: str, clips: Path):
+        self._clips.setdefault(engine, {}).setdefault(bank, {})[preset] = clips
+        self.save(auto=True)
+
+    def exists(self, engine: str, bank: str, preset: str):
+        clips = self._clips.get(engine, {}).get(bank, {}).get(preset)
+        if clips is None:
+            return False
+        if not isinstance(clips, dict) or len(clips) < 1:
+            return False
+        for song in clips.values():
+            path = STORAGE / song.get("clip", "/not-exists")
+            if not path.exists():
+                return False
+        return True
+
+    def load(self):
+        with self._filename.open("r") as src:
+            data = json.load(src)
+
+        self._engines = data.get("engines")
+        self._clips = data.get("clips")
+
+        if self._engines is None:
+            log.error(f"{PSW} ERROR: loading DB from {self._filename}, missing 'engines'!")
+            self._engines = {}
+        if self._clips is None:
+            log.error(f"{PSW} ERROR: loading DB from {self._filename}, missing 'clips'!")
+            self._clips = {}
+
+    def save(self, auto=False):
+        if auto:
+            elapsed = time.monotonic() - self._last_saved
+            if elapsed < self._autosave_time:
+                return
+
+        bkup = self._filename.with_suffix(self._filename.suffix + ".old")
+        data = {
+            "engines": self._engines,
+            "clips": self._clips,
+        }
+
+        if self._filename.exists():
+            shutil.copy(self._filename, bkup)
+        try:
+            with self._filename.open("w") as dst:
+                json.dump(data, dst, indent=3, ensure_ascii=False, default=str)
+        except Exception as err:
+            log.error(f"{PSE} ERROR: Could not save DB to disk: {err}")
+            if bkup.exists():
+                shutil.copy(bkup, self._filename)
