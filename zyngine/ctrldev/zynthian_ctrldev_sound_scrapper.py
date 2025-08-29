@@ -214,9 +214,6 @@ class SoundLibCreator(Thread):
             songs = self._record_melodic(name)
             self._clips_db.add_clips(engine.spec_name, bank, preset, songs)
 
-            # FIXME!! REMOVE!!!
-            if idx >= 10: return
-
     def _record_melodic(self, name):
         clips = {}
         for song_name, spec in self.SONGS.items():
@@ -490,7 +487,9 @@ class ClipsDB:
         if not isinstance(clips, dict) or len(clips) < 1:
             return False
         for song in clips.values():
-            path = STORAGE / song.get("clip", "/must-not-exist")
+            if not isinstance(song, str):
+                continue
+            path = STORAGE / (song or "/must-not-exist")
             if not path.exists():
                 return False
         return True
