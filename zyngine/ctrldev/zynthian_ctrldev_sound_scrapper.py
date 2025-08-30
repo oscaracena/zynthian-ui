@@ -24,6 +24,8 @@
 # ******************************************************************************
 
 import os
+import sys
+import select
 import re
 import time
 import logging
@@ -75,6 +77,10 @@ PSE = "::\033[1;31mSndLib\033[0m>"
 PSW = "::\033[1;33mSndLib\033[0m>"
 
 
+# TODO: add 're-do current' in REPL, useful if the level is too high, to a
+# stop, adjust mixer, re-do, and keep going
+
+
 # --------------------------------------------------------------------------
 # SoundLib, a library of sounds for Zynthian
 # --------------------------------------------------------------------------
@@ -105,11 +111,16 @@ class zynthian_ctrldev_sound_scrapper(zynthian_ctrldev_base):
         self._creator = SoundLibCreator(state_manager, self._converter)
         self._initialized = True
 
+        # Keep Zynthian on, even when there is no user interaction (as this is an
+        # automated tool)
+        state_manager.set_power_save_mode(False)
+
 
 class SoundLibCreator(Thread):
     LOW_DB            = -50
     MIDI_CH           = 9
-    SILENCE_THRESHOLD = 0.2  # in range [0, 1]
+    SILENCE_THRESHOLD = 0.15  # in range [0, 1]
+    NOTE_NAMES        = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
 
     # Songs played for melodic instruments, NAME: [bpm, notes]
     SONGS = {
@@ -139,10 +150,25 @@ class SoundLibCreator(Thread):
         self.start()
 
     def run(self):
+        try:
+            self._scrap_sounds()
+        except SystemExit:
+            pass
+
+        log.info(f"{PS1} Waiting for converter to finish...")
+        self._converter.wait_until_finish()
+        self._clips_db.save()
+        log.info(f"{PS1} Finished! You can now CLOSE this app (Ctrl+C).")
+
+    def _scrap_sounds(self):
         self._wait_until_ready()
         self._create_chain("SoundLib")
 
         for engine in self._get_engine_list():
+            if not engine.enabled:
+                log.warning(f"{PSW} Skipping engine {engine.spec_name} as its not enabled")
+                continue
+
             self._clips_db.define_engine(engine)
             if engine.cat.lower() == "percussion":
                 self._record_rhythmic_samples(engine)
@@ -152,33 +178,43 @@ class SoundLibCreator(Thread):
                 log.warning(f"{PSW} Skipping engine ({engine.spec_name}), "
                     f"unknown cat: {engine.cat}")
 
+            # FIXME!! REMOVE!!!
             break
 
-        log.info(f"{PS1} Done! Waiting for converter to finish...")
+    def _process_repl(self):
+        request, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not request:
+            return
+
+        sys.stdin.readline()
+        log.info(f"{PS1} REPL mode entered, waiting until converter finishes...")
         self._converter.wait_until_finish()
-        self._clips_db.save()
-        log.info(f"{PS1} Finished! You can now close this app.")
+        log.info(f"{PS1} Ready. Send 'c' to continue, 'q' to exit.")
+
+        while True:
+            cmd = input(f"{PS1} ").lower().strip()
+            if cmd == "c":
+                return
+            if cmd == "q":
+                sys.exit()
+            log.error(f"{PSE} Command not found.")
 
     def _get_engine_list(self):
         # FIXME: shall we include other categories? (Audio Generator, Effects, etc.)
         for idx, (name, spec) in enumerate(zynthian_lv2.engines_by_type["MIDI Synth"].items()):
             EngineSpec = namedtuple("EngineSpec", list(map(str.lower, spec.keys())) \
                 + ["spec_idx", "spec_name"])
-
-            # FIXME!! REMOVE!!!
-            if idx != 3: continue
-
             yield EngineSpec(spec_idx=idx, spec_name=name,
                 **{k.lower():v for k, v in spec.items()})
 
     def _iter_over_presets(self, processor, preload=True):
-        banks = processor.get_bank_list()
-        if len(banks) == 1 and banks[0][2] == None:
-            yield None, None
-            return
+        self._process_repl()
 
+        banks = processor.get_bank_list()
         for bank_idx, bank in enumerate(banks):
             bank_name = bank[2]
+            if not bank_name or bank_name == "None":
+                bank_name = "Default"
             processor.set_bank(bank_idx)
             processor.load_preset_list()
 
@@ -190,17 +226,41 @@ class SoundLibCreator(Thread):
 
                     # NOTE: There is a bug (or something), and first note of first preset
                     # sounds bad; flush it here
+                    # FIXME: maybe, this needs to be done only the first time...
                     lib_zyncore.ui_send_note_on(self.MIDI_CH, 60, 0)
                     time.sleep(0.5)
                     lib_zyncore.ui_send_note_off(self.MIDI_CH, 60, 0)
 
                 yield bank_name, preset_name
+                self._process_repl()
 
     def _record_rhythmic_samples(self, engine):
         log.info(f"{PS1} Processing '{engine.spec_name}' as rhythmic")
         processor = self._create_processor(engine)
-        for bank, preset in self._iter_over_presets(processor):
-            print(f"- {bank} > {preset}")
+        for idx, (bank, preset) in enumerate(self._iter_over_presets(processor)):
+            log.info(f"- Looking for instruments in {bank} > {preset}...")
+
+            # We need to iterate over every 127 possible notes, to find all instruments
+            counter = 0
+            for note in range(127):
+                print(f"\r  [note: {note}/127] ...", end="", flush=True)
+                note_name = self._midi_note_to_name(note)
+                instrument = f"{preset}_{note_name}"
+                if self._clips_db.exists(engine.spec_name, bank, instrument):
+                    print("\r", end="", flush=True)
+                    log.info(f"- Skipping existing instrument {idx}: {bank} > {instrument}")
+                    continue
+                if not self._has_instrument(note):
+                    continue
+                print("\r", end="", flush=True)
+                log.info(f"- Recording instrument {idx}: {bank} > {instrument}")
+                name = self._get_clip_name_for_preset(engine.name, bank, instrument)
+                song = self._record_rhythmic(name, note_name)
+                self._clips_db.add_clips(
+                    engine.spec_name, bank, instrument, {note_name: song})
+                counter += 1
+
+            print(f"\r- All 127 notes scanned, found {counter} instruments.")
 
     def _record_melodic_samples(self, engine):
         log.info(f"{PS1} Processing '{engine.spec_name}' as melodic")
@@ -221,10 +281,14 @@ class SoundLibCreator(Thread):
             filename = self._clips_dir / f"{name}-{song_name}.ogg"
             self._record_song(notes, bpm=bpm, filename=filename)
             clips[song_name] = filename.relative_to(STORAGE)
-
         return clips
 
-    def _record_song(self, song, bpm, filename: Path):
+    def _record_rhythmic(self, name: str, note: str):
+        filename = self._clips_dir / f"{name}.ogg"
+        self._record_song(note, bpm=30, filename=filename, vel=127)
+        return filename.relative_to(STORAGE)
+
+    def _record_song(self, song, bpm, filename: Path, vel=60):
         # Some examples:
         # - 'C4', a single C4 sustained all the bar
         # - 'C4 E4 G4 -', a Cmaj chord, arpeggiated in a bar (with a final rest)
@@ -244,7 +308,7 @@ class SoundLibCreator(Thread):
                 bar = bar[1:-1]
             notes = map(str.strip, bar.split())
             notes = self._to_midi_numbers(notes)
-            self._play_notes(notes, is_chord, bpm)
+            self._play_notes(notes, is_chord, bpm, vel)
 
         self._wait_for_silence()
         self._stop_recording(filename)
@@ -306,6 +370,19 @@ class SoundLibCreator(Thread):
                 return
             time.sleep(0.1)
 
+    def _has_instrument(self, note):
+        # wait for silence, play note, and check levels in the following time. If not levels, then
+        # there is no note
+        self._wait_for_silence(True)
+        lib_zyncore.ui_send_note_on(self.MIDI_CH, note, 127)
+        levels = []
+        for _ in range(3):
+            time.sleep(0.1)
+            levels.append(self._get_sound_level())
+        lib_zyncore.ui_send_note_off(self.MIDI_CH, note, 0)
+        self._wait_for_silence(True)
+        return sum(levels) > 0.5
+
     def _start_recording(self):
         self._recorder.start_recording()
 
@@ -353,6 +430,7 @@ class SoundLibCreator(Thread):
         self._chain_manager = self._zyngui.chain_manager
 
         log.info(f"{PS1} Controller is ready. Press ENTER to start.")
+        log.info(f"{PS1} Press ENTER again (while processing) to begin a REPL.")
         input()
 
     def _get_sound_level(self):
@@ -368,13 +446,19 @@ class SoundLibCreator(Thread):
             s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
             s2 = re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
             s3 = re.sub(r'\s+', '_', s2)
-            return re.sub(r'[^a-z0-9_]', '', s3)
+            s4 = re.sub(r'[^a-z0-9_]', '', s3)
+            return s4.replace("__", "_")
 
         return "-".join([
             camel_to_snake(engine),
             camel_to_snake(bank),
             camel_to_snake(preset),
         ])
+
+    def _midi_note_to_name(self, note):
+        octave = (note // 12) - 1
+        note_name = self.NOTE_NAMES[note % 12]
+        return f"{note_name}{octave}"
 
 
 class MediaConverter(Thread):
@@ -619,16 +703,16 @@ class TagClassifer:
         "asian": ["taiko", "gong", "koto"],
     }
 
+    BLACK_LIST = ["bank", "default"]
+
     @classmethod
     def extract_tags(cls, engine, bank, preset):
-        tags = set()
-
-        tags.add(f"engine:{engine.split('/')[-1].lower()}")
+        tags = {f"engine:{engine.split('/')[-1].lower()}"}
 
         bank_parts = re.findall(r'[A-Z]?[a-z]+|\d+', bank)
         for bp in bank_parts:
             tag = bp.lower()
-            if tag.isdigit() or tag == "bank":
+            if tag.isdigit() or tag in cls.BLACK_LIST:
                 continue
             tags.add(tag)
 
@@ -637,6 +721,8 @@ class TagClassifer:
         for pp in preset_parts:
             tag = pp.lower()
             if tag.isdigit() and tag not in cls.KNOWN_TAGS:
+                continue
+            if tag in cls.BLACK_LIST:
                 continue
             tags.add(tag)
 
