@@ -254,7 +254,7 @@ class zynthian_ctrldev_mvave_smc_pad_pocket(zynthian_ctrldev_zynmixer, zynthian_
 
     @classmethod
     def get_autoload_flag(cls):
-        return True
+        return False
 
     # # NOTE: this class is a singleton because Zynthian creates many instances of it!
     # def __new__(cls, *args, **kwargs):
