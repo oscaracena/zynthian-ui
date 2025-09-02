@@ -32,7 +32,7 @@ import logging
 import shutil
 import subprocess
 import json
-import readline  # do not remove
+import readline  # do not remove!
 from uuid import uuid4
 from threading import Thread, current_thread
 from pathlib import Path
@@ -77,12 +77,11 @@ PS1 = "::\033[1;32mSndLib\033[0m>"
 PSE = "::\033[1;31mSndLib\033[0m>"
 PSW = "::\033[1;33mSndLib\033[0m>"
 PSP = "::\033[1;34mSndLib\033[0m>"
+PSD = "::\033[1;36mSndLib\033[0m>"
 
 
-# TODO: REPL, add 're-do current', useful if the level is too high, to do an
+# TODO: REPL, add 're-do current', useful if the level is too high, to do a
 # stop, adjust mixer, re-do, and keep going
-# TODO: REPL, add a way run just one engine or preset, given its name
-
 
 # --------------------------------------------------------------------------
 # SoundLib, a library of sounds for Zynthian
@@ -150,53 +149,35 @@ class SoundLibCreator(Thread):
         self._clips_db = ClipsDB(STORAGE / "clips.json")
         {self._clips_db.define_song(name, spec) for name, spec in self.SONGS.items()}
 
+        self._edit_mode = False
+        self._force_overwrite = False
+
         self.dameon = True
         self.start()
 
     def run(self):
-        try:
-            self._scrap_sounds()
-        except SystemExit:
-            pass
-
-        log.info(f"{PS1} Waiting for converter to finish...")
-        self._converter.wait_until_finish()
-        self._clips_db.save()
-        self._clips_db.print_stats()
-        log.info(f"{PS1} Finished! You can now CLOSE this app (Ctrl+C).")
-
-    def _scrap_sounds(self):
         self._wait_until_ready()
         self._create_chain("SoundLib")
 
-        for idx, engine in enumerate(self._get_engine_list()):
-            engine_name = engine.name.split('/')[-1]
-            if not engine.enabled:
-                log.warning(f"{PSW} Skipping engine {engine_name} as its not enabled")
-                continue
+        try:
+            log.info(f"{PS1} Controller is ready. Press ENTER to start, R+ENTER for REPL.")
+            log.info(f"{PS1} Press ENTER again (while processing) to begin a REPL.")
+            cmd = input().lower().strip()
+            if cmd == "r":
+                self._process_repl(force=True)
 
-            if engine.channel != self._current_midi_ch:
-                self._chain_manager.set_midi_chan(self._chain_id, engine.channel)
-                self._current_midi_ch = engine.channel
+            self._scrap_engines()
+        except SystemExit:
+            pass
 
-            start = time.monotonic()
-            self._clips_db.define_engine(engine)
-            if engine.cat.lower() == "percussion":
-                self._record_rhythmic_samples(engine)
-            elif engine.cat.lower() in ("synth", "organ"):
-                self._record_melodic_samples(engine)
-            else:
-                log.warning(f"{PSW} Skipping engine ({engine_name}), "
-                    f"unknown cat: {engine.cat}")
-                continue
+        self._converter.wait_until_finish()
+        self._clips_db.save()
+        if self._edit_mode:
+            self._process_edit_mode()
 
-            elapsed = time.monotonic() - start
-            log.info(f"{PS1} Engine '{engine_name}' processed (took {elapsed:.1f} s)")
-
-            if self._converter.is_overloaded():
-                log.warning(f"{PSW} Too much work for the converter, leting him finish...")
-                self._converter.wait_until_finish()
-                log.info(f"{PS1} Ok, let's keep going!")
+        self._clips_db.print_stats()
+        log.info(f"{PS1} Finished! You can now CLOSE this app (Ctrl+C).")
+        os.system('stty sane')  # Recover echo stealed by readline in input()
 
     def _process_repl(self, force=False):
         if not force:
@@ -205,9 +186,9 @@ class SoundLibCreator(Thread):
                 return
             sys.stdin.readline()
 
-        log.info(f"{PS1} REPL mode entered, waiting until converter finishes...")
+        log.info(f"{PS1} REPL mode entered")
         self._converter.wait_until_finish()
-        log.info(f"{PS1} Ready. Send 'h' for help, 'q' to exit.")
+        log.info(f"{PS1} Ready. Send 'h' for help, 'c' to continue, 'q' to exit.")
 
         while True:
             cmd = input(f"{PSP} ").lower().strip()
@@ -217,14 +198,91 @@ class SoundLibCreator(Thread):
                 log.info("Available options:")
                 log.info("  h  - Show this help message")
                 log.info("  st - Print current DB stats")
+                log.info("  cl - Scan DB and clean orphaned .ogg files")
+                log.info("  e  - Enter EDIT mode")
                 log.info("  c  - Continue processing")
                 log.info("  q  - Quit")
+
+            elif cmd == "cl":
+                self._clips_db.remove_unlinked_media()
+
             elif cmd == "st":
                 self._clips_db.print_stats()
+
             elif cmd == "q":
                 sys.exit()
+
+            elif cmd == "e":
+                self._edit_mode = True
+                sys.exit()
+
             else:
                 log.error(f"{PSE} Command not found.")
+
+    def _process_edit_mode(self):
+        log.info("\n" + "=" * 50)
+        log.info(f"{PS1} EDIT mode entered. Here you can record specific engines/presets/notes..")
+        log.info(f"{PS1} Send 'h' for a list of available actions.")
+
+        while True:
+            cmd = input(f"{PSD} ").strip()
+            if cmd == "h":
+                log.info("Available options:")
+                log.info("  h  - Show this help message")
+                log.info("  p  - Proccess an engine, preset or note. Use '-f' to force.")
+                log.info("       Format: engine [[[|| bank] || preset] || NOTE1[,NOTE2...]]")
+                log.info("  cl - Scan DB and clean orphaned .ogg files")
+                log.info("  q  - Quit")
+
+            elif cmd == "q":
+                break
+
+            elif cmd == "cl":
+                self._clips_db.remove_unlinked_media()
+
+            elif cmd.startswith("p"):
+                fields = cmd.split()
+                self._force_overwrite = "-f" in fields
+                if (self._force_overwrite and len(fields) < 3) or (len(fields) < 2):
+                    log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
+                    continue
+                if self._force_overwrite:
+                    fields.remove("-f")
+                self._scrap_by_name(" ".join(fields[1:]))
+
+            else:
+                log.error(f"{PSE} Command not found.")
+
+        log.info(f"{PS1} Exiting EDIT mode...")
+        log.info("=" * 50 + "\n")
+
+    def _scrap_by_name(self, spec):
+        r_engine, r_bank, r_preset, r_notes = (spec.split("||") + [None] * 4)[:4]
+        if r_notes is not None:
+            r_notes = [self._to_midi_numbers([n])[0] for n in r_notes.split(",")]
+
+        self._scrap_engines(r_engine, r_bank, r_preset, r_notes)
+        self._converter.wait_until_finish()
+
+    def _scrap_engines(self, r_engine=None, r_bank=None, r_preset=None, r_notes=None):
+        if r_engine is not None:
+            for engine in self._get_engine_list():
+                if engine.name != r_engine:
+                    continue
+                if not engine.enabled:
+                    log.warning(f"{PSW} Skipping engine '{engine.name}' as its not enabled")
+                else:
+                    self._record_clips(engine, r_bank, r_preset, r_notes)
+                break
+            else:
+                log.error(f"{PSE} ERROR: Given engine '{r_engine}' not found!")
+            return
+
+        for engine in self._get_engine_list():
+            if not engine.enabled:
+                log.warning(f"{PSW} Skipping engine '{engine.name}' as its not enabled")
+                continue
+            self._record_clips(engine, r_bank, r_preset, r_notes)
 
     def _get_engine_list(self):
         # FIXME: shall we include other categories? (Audio Generator, Effects, etc.)
@@ -233,12 +291,12 @@ class SoundLibCreator(Thread):
                 **{k.lower():v for k, v in spec.items()})
 
             # ADLplug has an aditional percussion kit on channel 10
-            if name == "JV/ADLplug":
-                engine.name = f"{name}_CH0"
+            if engine.name == "ADLplug":
+                engine.name = f"{engine.name}_CH0"
                 engine.channel = 0
                 engine.cat = "Synth"
                 yield engine
-                engine.name = f"{name}_CH10"
+                engine.name = f"{engine.name}_CH10"
                 engine.channel = 9
                 engine.cat = "Percussion"
                 yield engine
@@ -246,18 +304,20 @@ class SoundLibCreator(Thread):
 
             yield engine
 
-    def _iter_over_presets(self, processor, preload=True):
+    def _iter_over_presets(self, processor, r_bank=None, r_preset=None):
         self._process_repl()
 
         banks = processor.get_bank_list()
         for bank_idx, bank in enumerate(banks):
-            # If bank is favorites pseudo-bank, skip it
-            if bank[0] == "*FAVS*":
-                continue
-
             bank_name = bank[2]
             if not bank_name or bank_name == "None":
                 bank_name = "Default"
+
+            if r_bank is not None and bank_name != r_bank:
+                continue
+            if bank[0] == "*FAVS*":  # Skip favorites pseudo-bank
+                continue
+
             processor.set_bank(bank_idx)
             processor.load_preset_list()
 
@@ -265,70 +325,101 @@ class SoundLibCreator(Thread):
                 preset_name = preset[2]
                 if not preset_name or preset_name == "None":
                     preset_name = "Default"
-                # Remove favs marker
-                if preset_name[0] == "❤":
+                if r_preset is not None and preset_name != r_preset:
+                    continue
+                if preset_name[0] == "❤":  # Remove favs marker
                     preset_name = preset_name[1:]
 
                 yield bank_name, preset_name
                 self._process_repl()
 
-    def _load_preset(self, processor, preset_name):
-        # processor.reset_preset()
-        # processor.preload_preset(preset_idx)
-        # processor.set_preset(preset_idx)
-        processor.set_preset_by_name(preset_name)
+    # def _load_preset(self, processor, preset_name):
+    #     processor.set_preset_by_name(preset_name)
 
-        # NOTE: There is a bug (or something), and first note of first preset
-        # sounds bad; flush it here
-        # FIXME: maybe, this needs to be done only the first time...
-        lib_zyncore.ui_send_note_on(self._current_midi_ch, 60, 0)
-        time.sleep(0.5)
-        lib_zyncore.ui_send_note_off(self._current_midi_ch, 60, 0)
-        self._state_manager.all_sounds_off()
+    #     # NOTE: There is a bug (or something), and first note of first preset
+    #     # sounds bad; flush it here
+    #     # FIXME: maybe, this needs to be done only the first time...
+    #     # NOTE: not sure if it only happens when preloading
+    #     lib_zyncore.ui_send_note_on(self._current_midi_ch, 60, 0)
+    #     time.sleep(0.5)
+    #     lib_zyncore.ui_send_note_off(self._current_midi_ch, 60, 0)
+    #     self._state_manager.all_sounds_off()
 
-    def _record_rhythmic_samples(self, engine):
-        engine_name = engine.name.split('/')[-1]
-        log.info(f"{PS1} Processing '{engine_name}' as rhythmic")
+    def _record_clips(self, engine, bank=None, preset=None, notes=None):
+        start = time.monotonic()
+
+        if engine.channel != self._current_midi_ch:
+            self._chain_manager.set_midi_chan(self._chain_id, engine.channel)
+            self._current_midi_ch = engine.channel
+
+        self._clips_db.define_engine(engine)
+        if engine.cat.lower() == "percussion":
+            self._record_rhythmic_samples(engine, bank, preset, notes)
+        elif engine.cat.lower() in ("synth", "organ", "piano"):
+            self._record_melodic_samples(engine, bank, preset)
+        else:
+            log.error(f"{PSE} Skipping engine ({engine.name}), "
+                f"unknown cat: {engine.cat}")
+            return
+
+        elapsed = int(time.monotonic() - start)
+        h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
+        log.info(f"{PS1} Engine '{engine.name}' processed (took {h}h {m}m {s}s)")
+
+    def _record_rhythmic_samples(self, engine, bank=None, preset=None, notes=None):
+        log.info(f"{PS1} Processing '{engine.name}' as rhythmic")
 
         processor = self._create_processor(engine)
-        for idx, (bank, preset) in enumerate(self._iter_over_presets(processor)):
+        for idx, (bank, preset) in enumerate(self._iter_over_presets(processor, bank, preset)):
             log.info(f" - Looking for instruments in {bank} > {preset}...")
 
-            # We need to iterate over every 127 possible notes, to find all instruments
+            # If not given, iterate over every 127 possible notes, to find all instruments
+            if notes is None:
+                notes = list(range(127))
+
             counter = 0
-            for note in range(127):
+            for note in notes:
+                self._process_repl()
                 print(f"   [note: {note}/127] ...\r", end="", flush=True)
                 note_name = self._midi_note_to_name(note)
                 instrument = f"{preset}_{note_name}"
-                if self._clips_db.exists(engine_name, bank, instrument):
-                    log.info(f" - Skipping existing instrument {idx}: {bank} > {instrument}")
-                    continue
-                self._load_preset(processor, preset)
+                if not self._force_overwrite:
+                    if self._clips_db.exists(engine.name, bank, instrument):
+                        log.info(f" - Skipping existing instrument {idx}: {bank} > {instrument}")
+                        continue
+                # self._load_preset(processor, preset)
+                processor.set_preset_by_name(preset)
                 if not self._has_instrument(note):
                     continue
+
                 log.info(f" - Recording instrument {idx}: {bank} > {instrument}")
-                name = self._get_clip_name_for_preset(engine_name, bank, instrument)
+                name = self._get_clip_name_for_preset(engine.name, bank, instrument)
                 song = self._record_rhythmic(name, note_name)
                 clip = {"note": note_name, "song": song}
-                self._clips_db.add_clips(engine_name, bank, instrument, clip)
+                self._clips_db.add_clips(engine.name, bank, instrument, clip)
                 counter += 1
 
-            log.info(f" - All 127 notes scanned, found {counter} instruments.")
+                self._converter_breathe()
 
-    def _record_melodic_samples(self, engine):
-        engine_name = engine.name.split('/')[-1]
-        log.info(f"{PS1} Processing '{engine_name}' as melodic")
+            log.info(f" - {len(notes)} notes scanned, found {counter} instruments.")
+
+    def _record_melodic_samples(self, engine, bank=None, preset=None):
+        log.info(f"{PS1} Processing '{engine.name}' as melodic")
 
         processor = self._create_processor(engine)
-        for idx, (bank, preset) in enumerate(self._iter_over_presets(processor)):
-            if self._clips_db.exists(engine_name, bank, preset):
-                log.info(f"  - Skipping existing preset {idx}: {bank} > {preset}")
-                continue
+        for idx, (bank, preset) in enumerate(self._iter_over_presets(processor, bank, preset)):
+            if not self._force_overwrite:
+                if self._clips_db.exists(engine.name, bank, preset):
+                    log.info(f"  - Skipping existing preset {idx}: {bank} > {preset}")
+                    continue
             log.info(f" - Recording preset {idx}: {bank} > {preset}")
-            self._load_preset(processor, preset)
-            name = self._get_clip_name_for_preset(engine_name, bank, preset)
+            # self._load_preset(processor, preset)
+            processor.set_preset_by_name(preset)
+            name = self._get_clip_name_for_preset(engine.name, bank, preset)
             songs = self._record_melodic(name)
-            self._clips_db.add_clips(engine_name, bank, preset, songs)
+            self._clips_db.add_clips(engine.name, bank, preset, songs)
+
+            self._converter_breathe()
 
     def _record_melodic(self, name):
         clips = {}
@@ -460,6 +551,10 @@ class SoundLibCreator(Thread):
         self._converter.add(source, filename)
 
     def _create_chain(self, name, midi_ch=None):
+        if self._chain_id is not None:
+            log.error(f"{PSE} ERROR: chain already created!")
+            return
+
         midi_ch = self.MIDI_CH if midi_ch is None else midi_ch
         self._chain_id = self._ensure("create soundlib chain",
             self._chain_manager.add_chain, None, midi_chan=midi_ch, title=name)
@@ -474,6 +569,12 @@ class SoundLibCreator(Thread):
         self._current_processor = self._ensure("add processor to chain",
             self._chain_manager.add_processor, self._chain_id, engine.spec_name)
         return self._current_processor
+
+    def _converter_breathe(self):
+        if self._converter.is_overloaded():
+            log.warning(f"{PSW} Too much work for the converter!")
+            self._converter.wait_until_finish()
+            log.info(f"{PS1} Ok, let's keep going!")
 
     def _ensure(self, desc, func, *args, **kwargs):
         while True:
@@ -494,12 +595,6 @@ class SoundLibCreator(Thread):
 
         self._zyngui = zynthian_gui_config.zyngui
         self._chain_manager = self._zyngui.chain_manager
-
-        log.info(f"{PS1} Controller is ready. Press ENTER to start, R+ENTER for REPL.")
-        log.info(f"{PS1} Press ENTER again (while processing) to begin a REPL.")
-        cmd = input().lower().strip()
-        if cmd == "r":
-            self._process_repl(force=True)
 
     def _get_sound_level(self):
         last_chan = self._zynmixer.MAX_NUM_CHANNELS - 1
@@ -557,6 +652,8 @@ class MediaConverter(Thread):
             log.warning(f"{PSW} WARNING: There are pending files to be converted!")
 
     def wait_until_finish(self):
+        if self._remaining > 0:
+            log.info(f"{PS1} Waiting for converter to finish...")
         self._tasks.join()
 
     def _handle_request(self, input_file: Path, output_file: Path):
@@ -628,6 +725,7 @@ class ClipsDB:
         self._last_snapshot = 0
         self._snapshots_dir = self._filename.parent / "snapshots"
         self._snapshots_dir.mkdir(parents=True, exist_ok=True)
+        self._dirty = False
 
         self._engines = {}
         self._clips = {}
@@ -639,17 +737,18 @@ class ClipsDB:
 
     def define_engine(self, engine: SimpleNamespace):
         keys = [
-            "name", "title", "type", "cat", "url", "descr",
+            "name", "type", "cat", "url", "descr",
             "quality", "complex", "spec_idx"
         ]
 
-        engine_name = engine.name.split('/')[-1]
         values = vars(engine)
-        self._engines[engine_name] = {k:values[k] for k in keys}
+        self._engines[engine.name] = {k:values[k] for k in keys}
+        self._dirty = True
         self.save(auto=True)
 
     def define_song(self, name, spec):
         self._songs[name] = dict(bpm=spec[0], notes=spec[1])
+        self._dirty = True
 
     def add_clips(self, engine_n: str, bank_n: str, preset_n: str, clips: dict):
         def_engine = {}
@@ -672,6 +771,7 @@ class ClipsDB:
         if not replaced:
             self._stats["clips"] += 1
 
+        self._dirty = True
         self.save(auto=True)
 
     def exists(self, engine: str, bank: str, preset: str):
@@ -710,8 +810,12 @@ class ClipsDB:
             for banks in engine.values()
         )
         log.info(f"{PS1} Loaded DB, stats: {self._stats}")
+        self._dirty = False
 
     def save(self, auto=False):
+        if not self._dirty:
+            return
+
         if auto:
             elapsed = time.monotonic() - self._last_saved
             if elapsed < self._autosave_time:
@@ -734,25 +838,60 @@ class ClipsDB:
         try:
             with self._filename.open("w") as dst:
                 json.dump(data, dst, indent=3, ensure_ascii=False, default=str)
-
-            # Create a new snapshot of the DB (each 5 mins)
-            if time.monotonic() - self._last_snapshot > 300:
-                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                snapshot = self._snapshots_dir / f"{self._filename.stem}_{ts}.json"
-                shutil.copy(self._filename, snapshot)
-                self._last_snapshot = time.monotonic()
-
-            size = f"{self._filename.stat().st_size:,}".replace(",", ".")
-            log.info(f"{PS1} Clips DB saved (size: {size} bytes)")
-            self._last_saved = time.monotonic()
-            bkup.unlink()
+                self._dirty = False
         except Exception as err:
             log.error(f"{PSE} ERROR: Could not save DB to disk: {err}")
             if bkup.exists():
                 shutil.copy(bkup, self._filename)
 
+        # Create a new snapshot of the DB (each 5 mins)
+        if time.monotonic() - self._last_snapshot > 300:
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            snapshot = self._snapshots_dir / f"{self._filename.stem}_{ts}.json"
+            shutil.copy(self._filename, snapshot)
+            self._last_snapshot = time.monotonic()
+
+        size = f"{self._filename.stat().st_size:,}".replace(",", ".")
+        log.info(f"{PS1} Clips DB saved (size: {size} bytes)")
+        self._last_saved = time.monotonic()
+        bkup.unlink()
+
     def print_stats(self):
         log.info(f"{PS1} Current DB, stats: {self._stats}")
+
+    def remove_unlinked_media(self):
+        log.info(f"{PS1} Scanning for unused media files...")
+        clip_files = set()
+        for engine in self._clips.values():
+            for bank in engine.values():
+                for preset in bank.values():
+                    for song in self.SONG_NAMES:
+                        if song in preset:
+                            path = Path(preset[song])
+                            clip_files.add(path.name)
+
+        media_dir = STORAGE / "clips"
+        to_remove = []
+        for file in media_dir.glob("*.ogg"):
+            if file.name not in clip_files:
+                to_remove.append(file)
+
+        if not to_remove:
+            log.info(f"{PS1} Scan complete. No orphaned files found.")
+            return
+
+        answer = input(f"{PSW} {len(to_remove)} files found to remove. Proceed? (y/N) ") == "y"
+        if answer:
+            for file in to_remove:
+                try:
+                    file.unlink()
+                    log.info(f"{PS1} Removed orphaned file: {file.name}")
+                except Exception as e:
+                    log.error(f"{PSE} Could not remove {file.name}: {e}")
+
+            log.info(f"{PS1} Clean complete.")
+        else:
+            log.info(f"{PS1} Clean cancelled, no files removed.")
 
 
 class TagClassifer:
