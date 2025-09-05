@@ -120,6 +120,7 @@ class zynthian_ctrldev_sound_scrapper(zynthian_ctrldev_base):
 
 class SoundLibCreator(Thread):
     LOW_DB            = -50
+    REC_LEVEL         = 0.5
     MIDI_CH           = 9
     SILENCE_THRESHOLD = 0  # in range [0, 1]
     NOTE_NAMES        = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
@@ -166,7 +167,11 @@ class SoundLibCreator(Thread):
             if cmd == "r":
                 self._process_repl(force=True)
 
-            self._scrap_engines()
+            while True:
+                self._scrap_engines()
+                log.info(f"{PS1} Scrapping finished! Changing to REPL mode.")
+                if not self._process_repl(force=True):
+                    break
         except SystemExit:
             pass
 
@@ -177,30 +182,30 @@ class SoundLibCreator(Thread):
 
         self._clips_db.print_stats()
         log.info(f"{PS1} Finished! You can now CLOSE this app (Ctrl+C).")
-        os.system('stty sane')  # Recover echo stealed by readline in input()
 
     def _process_repl(self, force=False):
         if not force:
             request, _, _ = select.select([sys.stdin], [], [], 0.05)
             if not request:
-                return
+                return False
             sys.stdin.readline()
 
         log.info(f"{PS1} REPL mode entered")
         self._converter.wait_until_finish()
-        log.info(f"{PS1} Ready. Send 'h' for help, 'c' to continue, 'q' to exit.")
+        log.info(f"{PS1} Ready. Send 'h' for help, 'c' to continue (or repeat), 'q' to exit.")
 
         while True:
             cmd = input(f"{PSP} ").lower().strip()
             if cmd == "c":
-                return
+                return True
+
             elif cmd == "h":
                 log.info("Available options:")
                 log.info("  h  - Show this help message")
                 log.info("  st - Print current DB stats")
                 log.info("  cl - Scan DB and clean orphaned .ogg files")
                 log.info("  e  - Enter EDIT mode")
-                log.info("  c  - Continue processing")
+                log.info("  c  - Continue processing (or repeat if finished)")
                 log.info("  q  - Quit")
 
             elif cmd == "cl":
@@ -333,18 +338,6 @@ class SoundLibCreator(Thread):
                 yield bank_name, preset_name
                 self._process_repl()
 
-    # def _load_preset(self, processor, preset_name):
-    #     processor.set_preset_by_name(preset_name)
-
-    #     # NOTE: There is a bug (or something), and first note of first preset
-    #     # sounds bad; flush it here
-    #     # FIXME: maybe, this needs to be done only the first time...
-    #     # NOTE: not sure if it only happens when preloading
-    #     lib_zyncore.ui_send_note_on(self._current_midi_ch, 60, 0)
-    #     time.sleep(0.5)
-    #     lib_zyncore.ui_send_note_off(self._current_midi_ch, 60, 0)
-    #     self._state_manager.all_sounds_off()
-
     def _record_clips(self, engine, bank=None, preset=None, notes=None):
         start = time.monotonic()
 
@@ -353,7 +346,7 @@ class SoundLibCreator(Thread):
             self._current_midi_ch = engine.channel
 
         self._clips_db.define_engine(engine)
-        if engine.cat.lower() == "percussion":
+        if engine.cat.lower() in ("percussion", "sampler"):
             self._record_rhythmic_samples(engine, bank, preset, notes)
         elif engine.cat.lower() in ("synth", "organ", "piano"):
             self._record_melodic_samples(engine, bank, preset)
@@ -387,7 +380,6 @@ class SoundLibCreator(Thread):
                     if self._clips_db.exists(engine.name, bank, instrument):
                         log.info(f" - Skipping existing instrument {idx}: {bank} > {instrument}")
                         continue
-                # self._load_preset(processor, preset)
                 processor.set_preset_by_name(preset)
                 if not self._has_instrument(note):
                     continue
@@ -412,8 +404,7 @@ class SoundLibCreator(Thread):
                 if self._clips_db.exists(engine.name, bank, preset):
                     log.info(f"  - Skipping existing preset {idx}: {bank} > {preset}")
                     continue
-            log.info(f" - Recording preset {idx}: {bank} > {preset}")
-            # self._load_preset(processor, preset)
+            log.info(f" - Recording preset \033[1;33m{idx}: {bank} > {preset}\033[0m")
             processor.set_preset_by_name(preset)
             name = self._get_clip_name_for_preset(engine.name, bank, preset)
             songs = self._record_melodic(name)
@@ -562,12 +553,19 @@ class SoundLibCreator(Thread):
         self._current_midi_ch = midi_ch
 
     def _create_processor(self, engine):
+        log.info(f"{PS1} Creating engine '{engine.name}'...")
         if self._current_processor is not None:
             self._ensure("remove current processor from chain",
                 self._chain_manager.remove_processor, self._chain_id, self._current_processor)
 
         self._current_processor = self._ensure("add processor to chain",
             self._chain_manager.add_processor, self._chain_id, engine.spec_name)
+
+        # Set level to a lower value, to avoid clipping
+        chain = self._chain_manager.get_chain(self._chain_id)
+        log.info(f"{PS1} Setting chain level to {self.REC_LEVEL * 100}%")
+        self._zynmixer.set_level(chain.mixer_chan, self.REC_LEVEL)
+
         return self._current_processor
 
     def _converter_breathe(self):
