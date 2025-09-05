@@ -120,7 +120,6 @@ class zynthian_ctrldev_sound_scrapper(zynthian_ctrldev_base):
 
 class SoundLibCreator(Thread):
     LOW_DB            = -50
-    REC_LEVEL         = 0.5
     MIDI_CH           = 9
     SILENCE_THRESHOLD = 0  # in range [0, 1]
     NOTE_NAMES        = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
@@ -141,6 +140,7 @@ class SoundLibCreator(Thread):
         self._zynmixer = state_manager.zynmixer
         self._recorder = state_manager.audio_recorder
         self._converter = converter
+        self._rec_level = 0.5
 
         self._chain_id = None
         self._current_processor = None
@@ -233,17 +233,33 @@ class SoundLibCreator(Thread):
             cmd = input(f"{PSD} ").strip()
             if cmd == "h":
                 log.info("Available options:")
-                log.info("  h  - Show this help message")
-                log.info("  p  - Proccess an engine, preset or note. Use '-f' to force.")
-                log.info("       Format: engine [[[|| bank] || preset] || NOTE1[,NOTE2...]]")
-                log.info("  cl - Scan DB and clean orphaned .ogg files")
-                log.info("  q  - Quit")
+                log.info("  h   - Show this help message")
+                log.info("  p   - Proccess an engine, preset or note, use '-f' to force")
+                log.info("        Format: engine [[[|| bank] || preset] || NOTE1[,NOTE2...]]")
+                log.info("  rs  - Scan DB and record missing .ogg files, use '-d' for dry")
+                log.info("  cl  - Scan DB and clean orphaned .ogg files")
+                log.info("  v N - Set recording volume to N, in %")
+                log.info("  q   - Quit")
 
             elif cmd == "q":
                 break
 
+            elif cmd.startswith("rs"):
+                self._scrap_missing("-d" in cmd)
+
             elif cmd == "cl":
                 self._clips_db.remove_unlinked_media()
+
+            elif cmd.startswith("v"):
+                fields = cmd.split()
+                if len(fields) == 2:
+                    try:
+                        self._rec_level = max(0, min(100, int(fields[1]) / 100.0))
+                        log.info(f"{PS1} Recording level set to {int(self._rec_level * 100)}%")
+                        continue
+                    except Exception:
+                        pass
+                log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
 
             elif cmd.startswith("p"):
                 fields = cmd.split()
@@ -268,6 +284,15 @@ class SoundLibCreator(Thread):
 
         self._scrap_engines(r_engine, r_bank, r_preset, r_notes)
         self._converter.wait_until_finish()
+
+    def _scrap_missing(self, dry=False):
+        for clip_id, files in self._clips_db.get_missing_files().items():
+            if dry:
+                print(f"{clip_id}:")
+                for f in files:
+                    print(f" - {f}")
+            else:
+                self._scrap_by_name(clip_id)
 
     def _scrap_engines(self, r_engine=None, r_bank=None, r_preset=None, r_notes=None):
         if r_engine is not None:
@@ -345,15 +370,18 @@ class SoundLibCreator(Thread):
             self._chain_manager.set_midi_chan(self._chain_id, engine.channel)
             self._current_midi_ch = engine.channel
 
-        self._clips_db.define_engine(engine)
+        clips_recorded = 0
         if engine.cat.lower() in ("percussion", "sampler"):
-            self._record_rhythmic_samples(engine, bank, preset, notes)
+            clips_recorded = self._record_rhythmic_samples(engine, bank, preset, notes)
         elif engine.cat.lower() in ("synth", "organ", "piano"):
-            self._record_melodic_samples(engine, bank, preset)
+            clips_recorded = self._record_melodic_samples(engine, bank, preset)
         else:
             log.error(f"{PSE} Skipping engine ({engine.name}), "
                 f"unknown cat: {engine.cat}")
             return
+
+        if clips_recorded > 0:
+            self._clips_db.define_engine(engine)
 
         elapsed = int(time.monotonic() - start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
@@ -362,6 +390,7 @@ class SoundLibCreator(Thread):
     def _record_rhythmic_samples(self, engine, bank=None, preset=None, notes=None):
         log.info(f"{PS1} Processing '{engine.name}' as rhythmic")
 
+        clip_count = 0
         processor = self._create_processor(engine)
         for idx, (bank, preset) in enumerate(self._iter_over_presets(processor, bank, preset)):
             log.info(f" - Looking for instruments in {bank} > {preset}...")
@@ -370,7 +399,7 @@ class SoundLibCreator(Thread):
             if notes is None:
                 notes = list(range(127))
 
-            counter = 0
+            instrument_count = 0
             for note in notes:
                 self._process_repl()
                 print(f"   [note: {note}/127] ...\r", end="", flush=True)
@@ -389,15 +418,19 @@ class SoundLibCreator(Thread):
                 song = self._record_rhythmic(name, note_name)
                 clip = {"note": note_name, "song": song}
                 self._clips_db.add_clips(engine.name, bank, instrument, clip)
-                counter += 1
+                instrument_count += 1
+                clip_count = 0
 
                 self._converter_breathe()
 
-            log.info(f" - {len(notes)} notes scanned, found {counter} instruments.")
+            log.info(f" - {len(notes)} notes scanned, found {instrument_count} instruments.")
+
+        return clip_count
 
     def _record_melodic_samples(self, engine, bank=None, preset=None):
         log.info(f"{PS1} Processing '{engine.name}' as melodic")
 
+        clip_count = 0
         processor = self._create_processor(engine)
         for idx, (bank, preset) in enumerate(self._iter_over_presets(processor, bank, preset)):
             if not self._force_overwrite:
@@ -409,8 +442,11 @@ class SoundLibCreator(Thread):
             name = self._get_clip_name_for_preset(engine.name, bank, preset)
             songs = self._record_melodic(name)
             self._clips_db.add_clips(engine.name, bank, preset, songs)
+            clip_count += 1
 
             self._converter_breathe()
+
+        return clip_count
 
     def _record_melodic(self, name):
         clips = {}
@@ -563,8 +599,8 @@ class SoundLibCreator(Thread):
 
         # Set level to a lower value, to avoid clipping
         chain = self._chain_manager.get_chain(self._chain_id)
-        log.info(f"{PS1} Setting chain level to {self.REC_LEVEL * 100}%")
-        self._zynmixer.set_level(chain.mixer_chan, self.REC_LEVEL)
+        log.info(f"{PS1} Setting chain level to {self._rec_level * 100}%")
+        self._zynmixer.set_level(chain.mixer_chan, self._rec_level)
 
         return self._current_processor
 
@@ -890,6 +926,24 @@ class ClipsDB:
             log.info(f"{PS1} Clean complete.")
         else:
             log.info(f"{PS1} Clean cancelled, no files removed.")
+
+    def get_missing_files(self):
+        log.info(f"{PS1} Scanning for missing media files...")
+        missing_presets = {}
+        for engine_name, engine in self._clips.items():
+            for bank_name, bank in engine.items():
+                for preset_name, preset in bank.items():
+                    for song in self.SONG_NAMES:
+                        if song in preset:
+                            path = STORAGE / preset[song]
+                            if not path.exists():
+                                clip_name = preset_name
+                                if "note" in preset and clip_name.endswith(preset["note"]):
+                                    clip_name = clip_name[:-(len(preset["note"] + 1))]
+                                    clip_name += f"||{preset['note']}"
+                                clip_id = f"{engine_name}||{bank_name}||{clip_name}"
+                                missing_presets.setdefault(clip_id, []).append(preset[song])
+        return missing_presets
 
 
 class TagClassifer:
