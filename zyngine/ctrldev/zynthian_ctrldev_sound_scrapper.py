@@ -207,6 +207,7 @@ class SoundLibCreator(Thread):
                 log.info("  st     Print current DB stats")
                 log.info("  cl     Scan DB and clean orphaned .ogg files")
                 log.info("  e      Enter EDIT mode")
+                log.info("  v <N>  Set recording volume to N, in %")
                 log.info("  c      Continue processing (or repeat if finished)")
                 log.info("  q      Quit")
 
@@ -215,6 +216,9 @@ class SoundLibCreator(Thread):
 
             elif cmd == "st":
                 self._clips_db.print_stats()
+
+            elif cmd.startswith("v"):
+                self._cmd_set_level(cmd)
 
             elif cmd == "q":
                 sys.exit()
@@ -226,6 +230,7 @@ class SoundLibCreator(Thread):
             else:
                 log.error(f"{PSE} Command not found.")
 
+    # FIXME: merge this EDIT mode into the standard REPL!!
     def _process_edit_mode(self):
         log.info("\n" + "=" * 50)
         log.info(f"{PS1} EDIT mode entered. Here you can record specific engines/presets/notes..")
@@ -247,8 +252,9 @@ class SoundLibCreator(Thread):
                 log.info("     -l      show the list")
                 log.info("     -c      clear the list")
                 log.info("     -a <P>  add the preset P to the list")
+                log.info("     -r <P>  remove the preset P from the list")
                 log.info("     -am     add the missing media presets to the list")
-                log.info("     -r      remove listed preset records from database")
+                log.info("     -rm     remove listed preset records from database")
                 log.info("  s      Save the clips database")
                 log.info("  q      Quit")
 
@@ -276,27 +282,23 @@ class SoundLibCreator(Thread):
                         self._clips_db.blacklist_clear()
                         continue
                     elif action == "-a" and len(fields) > 2:
-                        preset = " ".join(fields[2:])
+                        preset = cmd[cmd.index("-a")+2:].strip()
                         self._clips_db.blacklist_add(preset)
+                        continue
+                    elif action == "-r" and len(fields) > 2:
+                        preset = cmd[cmd.index("-r")+2:].strip()
+                        self._clips_db.blacklist_remove(preset)
                         continue
                     elif action == "-am":
                         self._clips_db.blacklist_add_media_missing()
                         continue
-                    elif action == "-r":
+                    elif action == "-rm":
                         self._clips_db.blacklist_remove_records()
                         continue
                 log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
 
             elif cmd.startswith("v"):
-                fields = cmd.split()
-                if len(fields) == 2:
-                    try:
-                        self._rec_level = max(0, min(100, int(fields[1]) / 100.0))
-                        log.info(f"{PS1} Recording level set to {int(self._rec_level * 100)}%")
-                        continue
-                    except Exception:
-                        pass
-                log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
+                self._cmd_set_level(cmd)
 
             elif cmd.startswith("p"):
                 fields = cmd.split()
@@ -304,15 +306,28 @@ class SoundLibCreator(Thread):
                 if (self._force_overwrite and len(fields) < 3) or (len(fields) < 2):
                     log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
                     continue
+
+                preset = cmd[1:]
                 if self._force_overwrite:
-                    fields.remove("-f")
-                self._scrap_by_name(" ".join(fields[1:]))
+                    preset = cmd[cmd.index("-f")+2:].strip()
+                self._scrap_by_name(preset)
 
             else:
                 log.error(f"{PSE} Command not found.")
 
         log.info(f"{PS1} Exiting EDIT mode...")
         log.info("=" * 50 + "\n")
+
+    def _cmd_set_level(self, cmd):
+        fields = cmd.split()
+        if len(fields) == 2:
+            try:
+                self._rec_level = max(0, min(100, int(fields[1]) / 100.0))
+                log.info(f"{PS1} Recording level set to {int(self._rec_level * 100)}%")
+                return
+            except Exception:
+                pass
+        log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
 
     def _scrap_by_name(self, spec):
         r_engine, r_bank, r_preset, r_notes = (spec.split("||") + [None] * 4)[:4]
@@ -1022,7 +1037,7 @@ class ClipsDB:
 
     def _get_clip_id(self, engine, bank, clip_name, note=None):
         if note is not None and clip_name.endswith(note):
-            clip_name = clip_name[:-(len(note + 1))]
+            clip_name = clip_name[:-(len(note) + 1)]
             clip_name += f"||{note}"
         return f"{engine}||{bank}||{clip_name}"
 
@@ -1061,8 +1076,10 @@ class ClipsDB:
 
     def blacklist_remove_records(self):
         if input(f"{PS1} This action can not be undone. Are you sure? (y/N) ") == "y":
-            for clip_id in self._blacklist:
-                engine, bank, preset = clip_id.split("||")
+            for clip_id in sorted(self._blacklist):
+                engine, bank, preset, note = (clip_id.split("||") + [None])[:4]
+                if note is not None:
+                    preset = f"{preset}_{note}"
                 if self.remove_preset(engine, bank, preset):
                     log.info(f"{PS1} Records of preset '{clip_id}' removed.")
         else:
