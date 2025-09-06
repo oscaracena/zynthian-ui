@@ -80,8 +80,10 @@ PSP = "::\033[1;34mSndLib\033[0m>"
 PSD = "::\033[1;36mSndLib\033[0m>"
 
 
-# TODO: REPL, add 're-do current', useful if the level is too high, to do a
-# stop, adjust mixer, re-do, and keep going
+# TODO:
+# - REPL, add 're-do current', useful if the level is too high/low, to do a
+#   stop, adjust mixer, re-do, and keep going
+# - add support for blacklisting presets, which are not scanned anymore
 
 # --------------------------------------------------------------------------
 # SoundLib, a library of sounds for Zynthian
@@ -201,12 +203,12 @@ class SoundLibCreator(Thread):
 
             elif cmd == "h":
                 log.info("Available options:")
-                log.info("  h  - Show this help message")
-                log.info("  st - Print current DB stats")
-                log.info("  cl - Scan DB and clean orphaned .ogg files")
-                log.info("  e  - Enter EDIT mode")
-                log.info("  c  - Continue processing (or repeat if finished)")
-                log.info("  q  - Quit")
+                log.info("  h      Show this help message")
+                log.info("  st     Print current DB stats")
+                log.info("  cl     Scan DB and clean orphaned .ogg files")
+                log.info("  e      Enter EDIT mode")
+                log.info("  c      Continue processing (or repeat if finished)")
+                log.info("  q      Quit")
 
             elif cmd == "cl":
                 self._clips_db.remove_unlinked_media()
@@ -233,13 +235,22 @@ class SoundLibCreator(Thread):
             cmd = input(f"{PSD} ").strip()
             if cmd == "h":
                 log.info("Available options:")
-                log.info("  h   - Show this help message")
-                log.info("  p   - Proccess an engine, preset or note, use '-f' to force")
-                log.info("        Format: engine [[[|| bank] || preset] || NOTE1[,NOTE2...]]")
-                log.info("  rs  - Scan DB and record missing .ogg files, use '-d' for dry")
-                log.info("  cl  - Scan DB and clean orphaned .ogg files")
-                log.info("  v N - Set recording volume to N, in %")
-                log.info("  q   - Quit")
+                log.info("  h      Show this help message")
+                log.info("  p <P>  Proccess an engine, preset or note")
+                log.info("            <P>: engine [[[|| bank] || preset] || NOTE1[,NOTE2...]]")
+                log.info("     -f     force mode, overwrite existing files")
+                log.info("  rs     Scan DB and record missing .ogg files")
+                log.info("     -d     Dry mode, only show missing files.")
+                log.info("  cl     Scan DB and clean orphaned .ogg files")
+                log.info("  v <N>  Set recording volume to N, in %")
+                log.info("  bl     Manage the preset blacklist, with the following options:")
+                log.info("     -l      show the list")
+                log.info("     -c      clear the list")
+                log.info("     -a <P>  add the preset P to the list")
+                log.info("     -am     add the missing media presets to the list")
+                log.info("     -r      remove listed preset records from database")
+                log.info("  s      Save the clips database")
+                log.info("  q      Quit")
 
             elif cmd == "q":
                 break
@@ -249,6 +260,32 @@ class SoundLibCreator(Thread):
 
             elif cmd == "cl":
                 self._clips_db.remove_unlinked_media()
+
+            elif cmd == "s":
+                log.info(f"{PS1} Saving...")
+                self._clips_db.save()
+
+            elif cmd.startswith("bl"):
+                fields = cmd.split()
+                if len(fields) > 1:
+                    action = fields[1]
+                    if action == "-l":
+                        self._clips_db.blacklist_show()
+                        continue
+                    elif action == "-c":
+                        self._clips_db.blacklist_clear()
+                        continue
+                    elif action == "-a" and len(fields) > 2:
+                        preset = " ".join(fields[2:])
+                        self._clips_db.blacklist_add(preset)
+                        continue
+                    elif action == "-am":
+                        self._clips_db.blacklist_add_media_missing()
+                        continue
+                    elif action == "-r":
+                        self._clips_db.blacklist_remove_records()
+                        continue
+                log.error(f"{PSE} Invalid command syntax. Send 'h' for help.")
 
             elif cmd.startswith("v"):
                 fields = cmd.split()
@@ -406,8 +443,9 @@ class SoundLibCreator(Thread):
                 note_name = self._midi_note_to_name(note)
                 instrument = f"{preset}_{note_name}"
                 if not self._force_overwrite:
-                    if self._clips_db.exists(engine.name, bank, instrument):
-                        log.info(f" - Skipping existing instrument {idx}: {bank} > {instrument}")
+                    exists, reason = self._clips_db.exists(engine.name, bank, instrument)
+                    if exists:
+                        log.info(f" - Skipping instrument {idx}: {bank} > {instrument}; {reason}")
                         continue
                 processor.set_preset_by_name(preset)
                 if not self._has_instrument(note):
@@ -434,8 +472,9 @@ class SoundLibCreator(Thread):
         processor = self._create_processor(engine)
         for idx, (bank, preset) in enumerate(self._iter_over_presets(processor, bank, preset)):
             if not self._force_overwrite:
-                if self._clips_db.exists(engine.name, bank, preset):
-                    log.info(f"  - Skipping existing preset {idx}: {bank} > {preset}")
+                exists, reason = self._clips_db.exists(engine.name, bank, preset)
+                if exists:
+                    log.info(f"  - Skipping preset {idx}: {bank} > {preset}, {reason}")
                     continue
             log.info(f" - Recording preset \033[1;33m{idx}: {bank} > {preset}\033[0m")
             processor.set_preset_by_name(preset)
@@ -570,7 +609,12 @@ class SoundLibCreator(Thread):
         time.sleep(0.3)
 
     def _stop_recording(self, filename: Path):
-        self._recorder.stop_recording()
+        try:
+            self._recorder.stop_recording()
+        except FileNotFoundError as err:
+            log.error(f"{PSE} ERROR from Zynthian: {err}")
+            return
+
         source = Path(self._recorder.filename)
         if not source.exists():
             log.error(f"{PSE} ERROR: record file '{source}' does not exist!")
@@ -751,6 +795,7 @@ class MediaConverter(Thread):
 
 class ClipsDB:
     SONG_NAMES = list(SoundLibCreator.SONGS.keys()) + ["song"]
+    VERSION    = "v0.2"
 
     def __init__(self, filename: Path, auto_save: int = 30):
         self._filename = filename
@@ -760,14 +805,27 @@ class ClipsDB:
         self._snapshots_dir = self._filename.parent / "snapshots"
         self._snapshots_dir.mkdir(parents=True, exist_ok=True)
         self._dirty = False
+        # self.__dirty = False
 
         self._engines = {}
         self._clips = {}
         self._songs = {}
         self._stats = dict(clips=0, engines=0, banks=0)
+        self._blacklist = set()
 
         if self._filename.exists():
             self.load()
+
+    # @property
+    # def _dirty(self):
+    #     return self.__dirty
+
+    # @_dirty.setter
+    # def _dirty(self, value):
+    #     self.__dirty = value
+    #     print("DIRTY:", value)
+    #     import traceback
+    #     traceback.print_stack(limit=2)
 
     def define_engine(self, engine: SimpleNamespace):
         keys = [
@@ -781,8 +839,10 @@ class ClipsDB:
         self.save(auto=True)
 
     def define_song(self, name, spec):
-        self._songs[name] = dict(bpm=spec[0], notes=spec[1])
-        self._dirty = True
+        song = dict(bpm=spec[0], notes=spec[1])
+        if self._songs.get(name) != song:
+            self._songs[name] = song
+            self._dirty = True
 
     def add_clips(self, engine_n: str, bank_n: str, preset_n: str, clips: dict):
         def_engine = {}
@@ -808,12 +868,25 @@ class ClipsDB:
         self._dirty = True
         self.save(auto=True)
 
+    def remove_preset(self, engine: str, bank: str, preset: str):
+        bank = self._clips.get(engine, {}).get(bank, {})
+        try:
+            bank.pop(preset)
+            self._dirty = True
+            return True
+        except KeyError:
+            return False
+
     def exists(self, engine: str, bank: str, preset: str):
+        clip_id = self._get_clip_id(engine, bank, preset)
+        if clip_id in self._blacklist:
+            return True, "\033[1;31mblacklisted clip\033[0m"
+
         clips = self._clips.get(engine, {}).get(bank, {}).get(preset)
         if clips is None:
-            return False
+            return False, "preset not found"
         if not isinstance(clips, dict) or len(clips) < 1:
-            return False
+            return False, "no clips in preset"
         for k, v in clips.items():
             if not isinstance(v, str):
                 continue
@@ -821,8 +894,9 @@ class ClipsDB:
                 continue
             path = STORAGE / (v or "/must-not-exist")
             if not path.exists():
-                return False
-        return True
+                return False, "missing file"
+
+        return True, "already exists"
 
     def load(self):
         with self._filename.open("r") as src:
@@ -834,6 +908,8 @@ class ClipsDB:
                 log.error(f"{PSW} ERROR: loading DB from {self._filename}, missing '{field}'!")
                 value = {}
             setattr(self, f"_{field}", value )
+
+        self._blacklist = set(data.get("meta", {}).get("blacklist", []))
 
         # Update stats after loading
         self._stats["engines"] = len(self._clips)
@@ -862,6 +938,8 @@ class ClipsDB:
             "meta": dict(
                 date=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
                 stats=self._stats,
+                version=self.VERSION,
+                blacklist=list(self._blacklist),
             )
         }
 
@@ -937,13 +1015,58 @@ class ClipsDB:
                         if song in preset:
                             path = STORAGE / preset[song]
                             if not path.exists():
-                                clip_name = preset_name
-                                if "note" in preset and clip_name.endswith(preset["note"]):
-                                    clip_name = clip_name[:-(len(preset["note"] + 1))]
-                                    clip_name += f"||{preset['note']}"
-                                clip_id = f"{engine_name}||{bank_name}||{clip_name}"
+                                clip_id = self._get_clip_id(
+                                    engine_name, bank_name, preset_name, preset.get("note"))
                                 missing_presets.setdefault(clip_id, []).append(preset[song])
         return missing_presets
+
+    def _get_clip_id(self, engine, bank, clip_name, note=None):
+        if note is not None and clip_name.endswith(note):
+            clip_name = clip_name[:-(len(note + 1))]
+            clip_name += f"||{note}"
+        return f"{engine}||{bank}||{clip_name}"
+
+    def blacklist_show(self, ):
+        if not self._blacklist:
+            log.info(f"{PS1} Currently, there are no black-listed presets.")
+            return
+
+        log.info(f"{PS1} Current black-listed presets:")
+        for p in sorted(self._blacklist):
+            log.info(f" - {p}")
+
+    def blacklist_clear(self, ):
+        if input(f"{PS1} This action can not be undone. Are you sure? (y/N) ") == "y":
+            self._blacklist = set()
+            self._dirty = True
+            log.info(f"{PS1} Preset black list cleared.")
+        else:
+            log.info(f"{PS1} Nothing done.")
+
+    def blacklist_add(self, preset):
+        self._blacklist.add(preset)
+        self._dirty = True
+        log.info(f"{PS1} Preset '{preset}' will not be scanned anymore.")
+
+    def blacklist_remove(self, preset):
+        self._blacklist.discard(preset)
+        self._dirty = True
+        log.info(f"{PS1} Preset '{preset}' removed from the black list.")
+
+    def blacklist_add_media_missing(self):
+        for clip_id in self.get_missing_files():
+            self._blacklist.add(clip_id)
+            self._dirty = True
+            log.info(f"{PS1} Preset '{clip_id}' added to the black list.")
+
+    def blacklist_remove_records(self):
+        if input(f"{PS1} This action can not be undone. Are you sure? (y/N) ") == "y":
+            for clip_id in self._blacklist:
+                engine, bank, preset = clip_id.split("||")
+                if self.remove_preset(engine, bank, preset):
+                    log.info(f"{PS1} Records of preset '{clip_id}' removed.")
+        else:
+            log.info(f"{PS1} Nothing done.")
 
 
 class TagClassifer:
